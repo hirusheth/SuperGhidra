@@ -1,0 +1,128 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superghidra"
+version = "0.3.0"
+description = "SuperGhidra: High-Performance Ghidra Architecture & GPU Acceleration Suite"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "yuatemycat" },
+]
+keywords = [
+    "ghidra",
+    "reverse-engineering",
+    "decompiler",
+    "gpu-acceleration",
+    "vulkan",
+    "directx12",
+    "z3",
+    "smt",
+    "pcode",
+    "arm64",
+    "x86-64",
+    "disassembler",
+    "binary-analysis",
+    "mcp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Disassemblers",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/yuatemycat/SuperGhidra"
+Repository = "https://github.com/yuatemycat/SuperGhidra"
+Documentation = "https://github.com/yuatemycat/SuperGhidra/tree/master/docs"
+"Issue Tracker" = "https://github.com/yuatemycat/SuperGhidra/issues"
+
+[project.optional-dependencies]
+smt = ["z3-solver"]
+gpu = ["wgpu"]
+storage = ["lz4", "zstandard"]
+frida = ["frida"]
+ghidra = ["pyghidra"]
+all = [
+    "z3-solver",
+    "wgpu",
+    "lz4",
+    "zstandard",
+    "frida",
+    "pyghidra",
+]
+
+[tool.setuptools]
+packages = [
+    "superghidra",
+    "superghidra.core",
+    "superghidra.storage",
+    "superghidra.acceleration",
+    "superghidra.diff",
+    "superghidra.lifters",
+    "superghidra.formats",
+    "superghidra.integrations",
+]
+py-modules = [
+    "apk_jni_cross_referencer",
+    "arm_thumb_decode",
+    "binary_diff_engine",
+    "binary_loader",
+    "colab_cloud_orchestrator",
+    "cross_platform_headless_harness",
+    "dependency_cache_dag",
+    "dwarf_pdb_preindexer",
+    "emulator_memory_sidecar",
+    "evidence_ledger",
+    "ghidra_extension_packager",
+    "ghidra_oracle",
+    "gpu_adrp_scanner",
+    "gpu_function_seeder",
+    "headless_analyzer_tuner",
+    "ida_flirt_bridge",
+    "ida_til_importer",
+    "live_binary_tools",
+    "mfc_archive",
+    "msvc_class_recovery",
+    "native_decompiler_pgo_builder",
+    "neural_decompiler_pipeline",
+    "pcode_lifter_bridge",
+    "resource_governor",
+    "semantic_delta_log",
+    "serialize_trace",
+    "shm_decompiler_bridge",
+    "smt_pcode_verifier",
+    "storage_compression_prototype",
+    "struct_shift_migrator",
+    "synthetic_symbol_exporter",
+    "x86_decode",
+]
+
+[project.scripts]
+superghidra = "superghidra.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests/formats"]
+python_files = ["test_*.py"]
+norecursedirs = ["scratch", ".*", "build", "dist", "*.egg", "templates", "docs", "ghidra_extension_skeleton", "scripts"]
+markers = [
+    "integration: marks integration tests that run against real binaries",
+]

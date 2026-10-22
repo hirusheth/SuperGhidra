@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.lock
+*.lock~
+.cache/
+build/
+dist/
+scratch/
+
+# Local agent skills and runtime data (not part of SuperGhidra)
+.agents/
+evidence_ledger.json
+.code-review-graph/
+*.class
+.ghidra-delta.jsonl
+
+# HumanEval-Decompile cache and generated score logs (rebuilt by the harness)
+benchmarks/humaneval_decompile/cache/
+benchmarks/humaneval_decompile/score_log.jsonl
+benchmarks/humaneval_decompile/score_summary.json
+benchmarks/humaneval_decompile/DOWNLOAD_FAILURE.txt
+
+# Oracle daemon runtime files
+ghidra_oracle_daemon.log
+ghidra_oracle_cache.db
+ghidra_overlay.json
+benchmarks/humaneval_decompile/gcc_compare_out/
+
+# Telemetry & Live Monitor Artifacts
+scripts/telemetry_monitor.py
+scripts/telemetry_state.json
+
+*.egg-info/
