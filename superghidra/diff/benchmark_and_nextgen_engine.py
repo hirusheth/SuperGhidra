@@ -158,8 +158,56 @@ class CRDTSessionForkManager:
             return a if a_hw_score > b_hw_score else b
         return a if (a.timestamp_ns, a.agent_id, a.c_type) >= (b.timestamp_ns, b.agent_id, b.c_type) else b
 
-    def merge_fork(self, source_fork_id: str, target_fork_id: str = "main") -> Dict[str, Any]:
-        """Merges `source_fork_id` into `target_fork_id` without lock contention."""
+    def discard_fork(self, fork_id: str) -> bool:
+        """
+        Discards and frees an isolated session fork from memory.
+        Root fork 'main' cannot be discarded.
+        """
+        if fork_id == "main":
+            raise ValueError("Root fork 'main' cannot be discarded.")
+        if fork_id in self._forks:
+            del self._forks[fork_id]
+            return True
+        return False
+
+    def list_forks(self) -> List[Dict[str, Any]]:
+        """Enumerates active in-memory session forks and their resource consumption."""
+        res = []
+        for fid, f in self._forks.items():
+            res.append({
+                "fork_id": fid,
+                "parent_fork_id": f.parent_fork_id,
+                "agent_id": f.agent_id,
+                "field_facts_count": len(f.field_facts),
+                "renamed_symbols_count": len(f.renamed_symbols),
+                "journal_ops": len(f.journal),
+            })
+        return res
+
+    def prune_stale_forks(self, max_idle_seconds: float = 3600.0) -> List[str]:
+        """
+        Prunes session forks that have had no journal activity for >= max_idle_seconds.
+        Never prunes 'main'. Returns list of pruned fork IDs.
+        """
+        now_ns = time.time_ns()
+        max_idle_ns = int(max_idle_seconds * 1e9)
+        to_prune = []
+        for fid, f in self._forks.items():
+            if fid == "main":
+                continue
+            last_activity = 0
+            if f.field_facts:
+                last_activity = max((fact.timestamp_ns for fact in f.field_facts.values()), default=0)
+            elif f.renamed_symbols:
+                last_activity = max((sym[1] for sym in f.renamed_symbols.values()), default=0)
+            if last_activity > 0 and (now_ns - last_activity) >= max_idle_ns:
+                to_prune.append(fid)
+        for fid in to_prune:
+            del self._forks[fid]
+        return to_prune
+
+    def merge_fork(self, source_fork_id: str, target_fork_id: str = "main", auto_discard: bool = False) -> Dict[str, Any]:
+        """Merges `source_fork_id` into `target_fork_id` without lock contention, optionally discarding source."""
         src = self._forks[source_fork_id]
         dst = self._forks[target_fork_id]
 
@@ -190,6 +238,9 @@ class CRDTSessionForkManager:
                 dst.renamed_symbols[rva] = (sname, sts, sagent)
                 merged_symbols += 1
 
+        if auto_discard and source_fork_id != "main":
+            self.discard_fork(source_fork_id)
+
         return {
             "source_fork": source_fork_id,
             "target_fork": target_fork_id,
@@ -197,6 +248,7 @@ class CRDTSessionForkManager:
             "merged_symbols": merged_symbols,
             "symbolic_tie_breaks": tie_breaks,
             "total_target_fields": len(dst.field_facts),
+            "source_discarded": auto_discard and source_fork_id != "main",
         }
 
 

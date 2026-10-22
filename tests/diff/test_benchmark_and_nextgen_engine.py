@@ -141,6 +141,45 @@ class TestCRDTSessionForkManager(unittest.TestCase):
         self.assertEqual(merge_info["merged_symbols"], 1)
         self.assertEqual(self.mgr._forks["main"].renamed_symbols[0x00401000][0], "executeOrder")
 
+    def test_discard_fork_and_auto_discard(self) -> None:
+        self.mgr.create_fork("fork_temp", "agent_temp")
+        self.mgr.rename_symbol("fork_temp", 0x00402000, "tempSymbol")
+        self.assertIn("fork_temp", self.mgr._forks)
+
+        # Cannot discard main root fork
+        with self.assertRaises(ValueError):
+            self.mgr.discard_fork("main")
+
+        # Discard existing fork
+        self.assertTrue(self.mgr.discard_fork("fork_temp"))
+        self.assertNotIn("fork_temp", self.mgr._forks)
+        self.assertFalse(self.mgr.discard_fork("fork_temp"))
+
+        # Test merge_fork with auto_discard=True
+        self.mgr.create_fork("fork_auto", "agent_auto")
+        self.mgr.rename_symbol("fork_auto", 0x00403000, "autoCleaned")
+        merge_res = self.mgr.merge_fork("fork_auto", "main", auto_discard=True)
+        self.assertTrue(merge_res["source_discarded"])
+        self.assertNotIn("fork_auto", self.mgr._forks)
+        self.assertEqual(self.mgr._forks["main"].renamed_symbols[0x00403000][0], "autoCleaned")
+
+    def test_list_forks_and_prune_stale(self) -> None:
+        self.mgr.create_fork("fork_active", "agent_act")
+        self.mgr.assert_field_type(
+            "fork_active", "Config", 0x04, "uint32_t", 4,
+            TypeConfidenceTier.HEURISTIC_NAME, "heuristic",
+        )
+        fork_list = self.mgr.list_forks()
+        fork_ids = [f["fork_id"] for f in fork_list]
+        self.assertIn("main", fork_ids)
+        self.assertIn("fork_active", fork_ids)
+
+        # Stale prune with 0 idle threshold should prune fork_active
+        pruned = self.mgr.prune_stale_forks(max_idle_seconds=0.0)
+        self.assertIn("fork_active", pruned)
+        self.assertNotIn("fork_active", self.mgr._forks)
+        self.assertIn("main", self.mgr._forks)
+
 
 class TestCrossVersionDiffEngine(unittest.TestCase):
     """Tests 32-dim CFG cosine matching, struct shift detection, and SHA-256 delta logging."""

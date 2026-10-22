@@ -113,6 +113,7 @@ py-modules = [
     "struct_shift_migrator",
     "synthetic_symbol_exporter",
     "x86_decode",
+    "ghidra_gui_overlay_sync",
 ]
 
 [project.scripts]
