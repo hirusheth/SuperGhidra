@@ -18,7 +18,7 @@ SuperGhidra spans four distinct execution paths. Pick the entry point that match
 | **Decompile real functions, query xrefs, or rename symbols** | `python ghidra_oracle.py <subcommand>` | **Yes** (Ghidra 11/12 + OpenJDK 21 + PyGhidra) | **No** (writes go to JSON overlay / fork journal) |
 | **Recover MSVC RTTI, MFC `CRuntimeClass`, `Serialize()`, or PE/ELF/Mach-O headers** | `python -m superghidra.formats.msvc_class_recovery <binary>` or `superghidra rtti-recover <binary> -o classes.json` | **No** (standalone Python) | **No** (exports JSON, DWARF 5, Breakpad, or `.map`) |
 | **Connect Claude Desktop, Cursor, or Antigravity to an open target** | MCP Server (`superghidra-mcp` via [SuperghidraMCP](https://github.com/yuatemycat/SuperGhidraMCP)) | **Yes** (connects to running daemon) | **No** (commits gated by validation + overlay sync) |
-| **Run GPU/SIMD ARM64 scans, LZ4/Zstd buffer compression, or Z3 P-code checks** | `superghidra <subcommand>` (Unified CLI) | **No** (standalone Python / NumPy / WGPU / Z3) | **No** |
+| **Run GPU/SIMD ARM64 scans, LZ4/Zstd buffer compression, or Z3 P-code checks** | Python API / standalone modules (or MCP tools) | **No** (standalone Python / NumPy / WGPU / Z3) | **No** |
 
 > [!WARNING]
 > **The `superghidra decompile` CLI Subcommand is Experimental**
@@ -139,7 +139,7 @@ Mutations are recorded in `ghidra_overlay.json` to prevent `.rep` lock collision
      ```bash
      superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py
      ```
-  2. In Ghidra's CodeBrowser, navigate to **Window $\rightarrow$ Script Manager**.
+  2. In Ghidra's CodeBrowser, navigate to **Window → Script Manager**.
   3. Add the output directory to Script Paths and run `ghidra_gui_overlay_sync.py`. All renames, comments, and type definitions apply atomically inside your active GUI session.
 
 * **Option 2 — Headless Journal Replay & Auto-Discard (`merge_fork`):**
@@ -233,15 +233,15 @@ If running the server via HTTP (`superghidra-mcp --transport streamable-http --p
 | :--- | :--- | :--- |
 | **`core` (Daemon & Cache)** | Persistent RPC server on `127.0.0.1:5073`, 64 KB shared-memory ring buffer (`5.12 µs` IPC), SQLite L2 cache (`>100k req/s`), JSON write overlay, and resource governor (`eco` / `balanced` / `turbo` / `auto`). | Runs on all platforms (Windows/Linux/macOS). Requires PyGhidra + OpenJDK 21 only when attached to a live `.rep`. |
 | **Binary & C++ Recovery (`formats`)** | ELF / PE / Mach-O loader, MSVC RTTI & MFC `CRuntimeClass` recovery, `Serialize()` layout tracing, `CArchive` decoder, PDB MSF 7.0 / GSI hash stream and TPI CodeView leaf type records, DWARF 5 / Breakpad / `.map` export. | Pure Python; zero JVM or Ghidra dependency. |
-| **Lifter & Z3 Prover (`[smt]`)** | Pure-Python ARM64 $\rightarrow$ P-code lifter (integer, exclusive memory, SIMD vector arithmetic, ARMv8.1-A atomics), x86/ARM/Thumb decoders, and Z3 equivalence prover for testing whether decompiled C matches lifted IR. | Requires `z3-solver`. **By design, returns `UNKNOWN` instead of guessing** on floating-point ops, unhandled instructions, or unbounded loops. |
-| **GPU / SIMD ARM64 Scanner (`[gpu]`)** | Scans ARM64 binaries for `ADRP + ADD/LDR` pairs and function prologues (`20 MB` / `5.2M` insns in `41.20 ms` = `127.25 M insn/s` on RTX A5500). | Uses WGPU (DirectX 12 / Vulkan / Metal) for blocks $\ge 5\text{ MB}$. **Automatically falls back to NumPy CPU SIMD** (`143.95 M insn/s` on 4 MB blocks) when $< 5\text{ MB}$ or when no GPU is present. |
+| **Lifter & Z3 Prover (`[smt]`)** | Pure-Python ARM64 → P-code lifter (integer, exclusive memory, SIMD vector arithmetic, ARMv8.1-A atomics), x86/ARM/Thumb decoders, and Z3 equivalence prover for testing whether decompiled C matches lifted IR. | Requires `z3-solver`. **By design, returns `UNKNOWN` instead of guessing** on floating-point ops, unhandled instructions, or unbounded loops. |
+| **GPU / SIMD ARM64 Scanner (`[gpu]`)** | Scans ARM64 binaries for `ADRP + ADD/LDR` pairs and function prologues (`20 MB` / `5.2M` insns in `41.20 ms` = `127.25 M insn/s` on RTX A5500). | Uses WGPU (DirectX 12 / Vulkan / Metal) for blocks ≥ 5 MB. **Automatically falls back to NumPy CPU SIMD** (`143.95 M insn/s` on 4 MB blocks) when < 5 MB or when no GPU is present. |
 | **Cross-Version Matcher (`diff`)** | Matches functions across binary builds using CFG feature vectors, detects shifted struct field offsets, and rewrites field accesses. | Runs on CPU (NumPy accelerated). |
 | **Storage Codec (`[storage]`)** | Compresses Ghidra 16 KB `BufferFile` pages using LZ4 (`442.9 MB/s`, `79.32%` savings) or Zstd Level 3 (`206.5 MB/s`, `86.47%` savings). | Requires `lz4` and `zstandard` packages; includes standalone Java `BufferFile` codec. |
-| **Mobile & LLM Naming (`[frida]`)** | APK $\leftrightarrow$ JNI cross-referencer, allow-listed Android emulator memory reader, and guarded LLM symbol/struct naming pipeline. | Commits symbols/structs **only** after automated validation of vtable slots, field offsets, and allocation sizes. |
+| **Mobile & LLM Naming (`[frida]`)** | APK ↔ JNI cross-referencer, allow-listed Android emulator memory reader, and guarded LLM symbol/struct naming pipeline. | Commits symbols/structs **only** after automated validation of vtable slots, field offsets, and allocation sizes. |
 
 Each package has its own README under [`superghidra/`](superghidra/).
 
-## Results so far
+## Results So Far
 
 All benchmarks are measured on physical hardware (Intel Core i9-12950HX, 64 GB DDR5, NVIDIA RTX A5500 Laptop GPU) and across the multi-platform CI matrix. Full empirical data and logs are in [`docs/benchmarks/`](docs/benchmarks/).
 
@@ -272,7 +272,7 @@ Addresses the dataset contamination problem in neural decompiler benchmarks (suc
 
 - **Finding:** Raw LLM predictions achieved a 100% compilation rate but a 0.0% semantic pass rate due to subtle binary logic hallucinations. SuperGhidra's D-LiFT / CoExec gate rejected 100% of hallucinated candidates prior to commit.
 
-### Reference Puzzle Baseline: HumanEval-Decompile (1,296 Evaluated Functions)
+### Reference Puzzle Baseline: HumanEval-Decompile (1,300 Evaluated Functions)
 
 <!-- humaneval:begin -->
 | Metric | IDA raw | IDA + filter | Ghidra raw | Ghidra + filter |
@@ -385,7 +385,7 @@ print(sg.SMTPcodeVerifier().verify_equivalence(ops, ops).equivalent)
 | `GHIDRA_INSTALL_DIR`, `JAVA_HOME` | Ghidra and JDK locations (daemon, headless runs, Java codec build) |
 | `SUPERGHIDRA_PROJECTS` | Default projects for the daemon: `dir,name[,program]` entries joined by `;` |
 | `SUPERGHIDRA_MSVC_ROOT` | Portable MSVC folder, used when gcc/clang aren't on `PATH` |
-| `SUPERGHIDRA_TEST_ARM64_ELF`, `SUPERGHIDRA_TEST_SWDM`, `SUPERGHIDRA_TEST_SW_ROOT` | Optional real binaries / a SOLIDWORKS install for the integration tests. Those tests skip when unset. |
+| `SUPERGHIDRA_TEST_ARM64_ELF`, `SUPERGHIDRA_TEST_SW_ROOT` | Optional real binaries / a SOLIDWORKS install for the integration tests. Those tests skip when unset. |
 
 ## Troubleshooting & Common Gotchas
 
@@ -402,7 +402,7 @@ print(sg.SMTPcodeVerifier().verify_equivalence(ops, ops).equivalent)
 * **Proposed struct or symbol from the LLM naming pipeline was rejected:**
   The naming pipeline enforces structural invariants before writing to the overlay. Check the daemon log for `VtableSlotMismatch`, `FieldOffsetOutOfBounds`, or `AllocationSizeConflict`.
 
-## Known limitations
+## Known Limitations
 
 - The Java codec doesn't compress Ghidra projects transparently. Ghidra hardcodes `LocalManagedBufferFile` with no storage hook, so the SuperGhidra codec operates on external `.sgdb` files or requires patching Ghidra's core jar.
 - PDB export implements CodeView 7.0 MSF structures with a Global Symbol Index (GSI) 4096-bucket hash table; MSVC and LLVM toolchains can read symbols, while complex type streams remain under active expansion.
@@ -413,7 +413,7 @@ print(sg.SMTPcodeVerifier().verify_equivalence(ops, ops).equivalent)
 
 More detail is in [PLAN.md](PLAN.md).
 
-## Repository layout
+## Repository Layout
 
 ```
 superghidra/   the package, split into the seven areas above

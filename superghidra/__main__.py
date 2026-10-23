@@ -75,7 +75,8 @@ def create_parser() -> argparse.ArgumentParser:
 
 def cmd_version() -> int:
     import platform
-    print("SuperGhidra v0.2.0")
+    from superghidra import __version__
+    print(f"SuperGhidra v{__version__}")
     print(f"Platform: {platform.system()} {platform.machine()} ({platform.platform()})")
     print(f"Python: {sys.version.split()[0]}")
 
