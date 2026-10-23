@@ -42,7 +42,7 @@ Use this instruction file when operating as an autonomous reverse-engineering ag
 | Disassemble raw instructions | `python ghidra_oracle.py disassemble <addr> [count]` or MCP `disassemble` | Spawning fresh headless instances per block |
 | Translate VA <-> RVA | `python ghidra_oracle.py rva <addr>` or MCP `rva_translate` | Manual image base arithmetic |
 | Push overlay edits to Ghidra GUI | `superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py` | Telling user to restart Ghidra |
-| Manage multi-agent session forks | MCP `list_forks`, `merge_fork`, `discard_fork` | Concurrent uncoordinated writes to main state |
+| Manage multi-agent session forks | MCP `list_forks`, `merge_fork(auto_discard=True)`, `discard_fork` | Concurrent uncoordinated writes to main state |
 
 ## 3. Standard 5-Step Autonomous RE Workflow
 
@@ -167,5 +167,8 @@ Provide the human analyst with a clean path to integrate your mutations:
    superghidra overlay-sync --overlay ghidra_overlay.json --diff
    ```
 
-3. **Multi-Agent Collaborative Sessions:**
-   When running multiple agents on parallel tasks, isolate each agent in a session fork (`create_fork`). Merge into main via MCP `merge_fork` after verification. The CRDT semilattice resolves conflicting field types using type confidence tiers and hardware instruction evidence.
+3. **Multi-Agent Collaborative Sessions & Auto-Discard:**
+   When running multiple agents on parallel tasks, isolate each agent in a session fork (`create_fork`). Merge into main via MCP `merge_fork(fork_id, auto_discard=True)` after verification.
+   - **Auto-Discard:** Always pass `auto_discard=True` on `merge_fork`. Once all operations merge cleanly with zero pending conflicts (`pending_ops == 0`), SuperGhidra automatically deletes the fork's workspace directory and transaction journal to prevent storage leaks.
+   - **Manual Cleanup:** Call `discard_fork(fork_id)` to explicitly drop abandoned or unneeded session forks.
+   - The CRDT semilattice resolves conflicting field types using type confidence tiers and hardware instruction evidence.

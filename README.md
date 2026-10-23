@@ -17,7 +17,7 @@ SuperGhidra spans four distinct execution paths. Pick the entry point that match
 | :--- | :--- | :---: | :---: |
 | **Decompile real functions, query xrefs, or rename symbols** | `python ghidra_oracle.py <subcommand>` | **Yes** (Ghidra 11/12 + OpenJDK 21 + PyGhidra) | **No** (writes go to JSON overlay / fork journal) |
 | **Recover MSVC RTTI, MFC `CRuntimeClass`, `Serialize()`, or PE/ELF/Mach-O headers** | `python -m superghidra.formats.msvc_class_recovery <binary>` or `superghidra rtti-recover <binary> -o classes.json` | **No** (standalone Python) | **No** (exports JSON, DWARF 5, Breakpad, or `.map`) |
-| **Connect Claude Desktop, Cursor, or Antigravity to an open target** | MCP Server (`pyghidra-mcp`) | **Yes** (connects to running daemon) | **No** (commits gated by validation + overlay sync) |
+| **Connect Claude Desktop, Cursor, or Antigravity to an open target** | MCP Server (`superghidra-mcp` via [SuperghidraMCP](https://github.com/yuatemycat/SuperGhidraMCP)) | **Yes** (connects to running daemon) | **No** (commits gated by validation + overlay sync) |
 | **Run GPU/SIMD ARM64 scans, LZ4/Zstd buffer compression, or Z3 P-code checks** | `superghidra <subcommand>` (Unified CLI) | **No** (standalone Python / NumPy / WGPU / Z3) | **No** |
 
 > [!WARNING]
@@ -142,12 +142,19 @@ Mutations are recorded in `ghidra_overlay.json` to prevent `.rep` lock collision
   2. In Ghidra's CodeBrowser, navigate to **Window $\rightarrow$ Script Manager**.
   3. Add the output directory to Script Paths and run `ghidra_gui_overlay_sync.py`. All renames, comments, and type definitions apply atomically inside your active GUI session.
 
-* **Option 2 — Headless Journal Replay (`merge_fork`):**
-  Close the project in the Ghidra GUI to release the `.rep` lock, then replay the journal or merge session forks using `merge_fork`.
+* **Option 2 — Headless Journal Replay & Auto-Discard (`merge_fork`):**
+  Close the project in the Ghidra GUI to release the `.rep` lock, then replay the journal or merge session forks using `merge_fork(fork_id, auto_discard=True)`.
+  When `auto_discard=True`, once all operations merge cleanly with zero pending conflicts (`pending_ops == 0`), SuperGhidra automatically deletes the fork's isolated directory and transaction journal to reclaim disk storage. Unneeded or stale forks can also be deleted directly via `discard_fork(fork_id)`.
 
 ## Agent & MCP Configuration (Claude Desktop, Cursor, Antigravity)
 
-SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Context Protocol (MCP) using [pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp) / [SuperghidraMCP](https://github.com/yuatemycat/SuperghidraMCP) (including `recover_cpp_classes`, `trace_serialize`, `diff_binaries`, `verify_smt_equivalence`, and `gpu_adrp_scan`). This enables AI coding agents to inspect binaries, query call graphs, and propose validated renames autonomously.
+SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Context Protocol (MCP) using [SuperghidraMCP](https://github.com/yuatemycat/SuperGhidraMCP) (including `recover_cpp_classes`, `trace_serialize`, `diff_binaries`, `verify_smt_equivalence`, and `gpu_adrp_scan`). This enables AI coding agents to inspect binaries, query call graphs, and propose validated renames autonomously.
+
+Install the MCP server from source:
+
+```bash
+pip install git+https://github.com/yuatemycat/SuperGhidraMCP.git
+```
 
 ### Claude Desktop (`claude_desktop_config.json`)
 
@@ -155,7 +162,7 @@ SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Conte
 {
   "mcpServers": {
     "superghidra": {
-      "command": "pyghidra-mcp",
+      "command": "superghidra-mcp",
       "args": [
         "-t",
         "stdio",
@@ -171,7 +178,10 @@ SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Conte
 }
 ```
 
-*Alternative using `uvx`:* Replace `"command": "pyghidra-mcp"` with `"command": "uvx"` and prepend `"pyghidra-mcp"` to `"args"`.
+*Alternative using `uvx`:* Replace `"command": "superghidra-mcp"` with `"command": "uvx"` and set `"args"` to:
+```json
+["--from", "git+https://github.com/yuatemycat/SuperGhidraMCP.git", "superghidra-mcp", "-t", "stdio", "--project-path", "<path_to_gpr_or_binary>"]
+```
 
 ### Cursor (`.cursor/mcp.json`)
 
@@ -179,7 +189,7 @@ SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Conte
 {
   "mcpServers": {
     "superghidra": {
-      "command": "pyghidra-mcp",
+      "command": "superghidra-mcp",
       "args": [
         "-t",
         "stdio",
@@ -200,7 +210,7 @@ SuperGhidra exposes 38 specialized reverse-engineering tools via the Model Conte
 For remote daemon connections or HTTP-based agent configurations:
 
 ```bash
-claude mcp add --transport http pyghidra-mcp http://127.0.0.1:8000/mcp
+claude mcp add --transport http superghidra http://127.0.0.1:8000/mcp
 ```
 
 Or configure via YAML:
@@ -208,7 +218,7 @@ Or configure via YAML:
 ```yaml
 mcp_servers:
   superghidra:
-    command: pyghidra-mcp
+    command: superghidra-mcp
     args:
       - "-t"
       - "stdio"
