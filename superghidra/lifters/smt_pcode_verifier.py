@@ -16,7 +16,7 @@ Frontier 2 of SuperGhidra Reformation:
 - Formulates formal equivalence queries in Z3:
     Not(symbolic_pcode_state == symbolic_c_state)
 - Returns structured VerificationResult (UNSAT = proven equivalent, SAT = counterexample).
-- Seamlessly integrates with ReconstructionObligationLedger (FUNCTION_HOOK and
+- Integrates with ReconstructionObligationLedger (FUNCTION_HOOK and
   STRUCT_FIELD_RENAME obligations).
 """
 
@@ -44,9 +44,14 @@ try:
     from pcode_lifter_bridge import (
         ARM64PcodeLifter,
         AddressSpace,
+        CANONICAL_REG_OFFSETS,
+        DaemonPcodeBackend,
         PcodeOp,
         PcodeOpcode,
+        PypcodeSleighBackend,
+        UnifiedPcodeLifter,
         Varnode,
+        X86_64PcodeLifter,
     )
     from evidence_ledger import (
         CheckResult,
@@ -61,9 +66,14 @@ except ImportError:
     from pcode_lifter_bridge import (  # type: ignore
         ARM64PcodeLifter,
         AddressSpace,
+        CANONICAL_REG_OFFSETS,
+        DaemonPcodeBackend,
         PcodeOp,
         PcodeOpcode,
+        PypcodeSleighBackend,
+        UnifiedPcodeLifter,
         Varnode,
+        X86_64PcodeLifter,
     )
     from evidence_ledger import (  # type: ignore
         CheckResult,
@@ -89,6 +99,7 @@ class VerificationResult:
     model_inputs: Optional[Dict[str, Any]] = None
     pcode_out: Optional[str] = None
     c_out: Optional[str] = None
+    backend_used: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -100,7 +111,11 @@ class VerificationResult:
             "model_inputs": self.model_inputs,
             "pcode_out": self.pcode_out,
             "c_out": self.c_out,
+            "backend_used": self.backend_used,
         }
+
+
+EquivalenceResult = VerificationResult
 
 
 # ==============================================================================
@@ -202,8 +217,10 @@ class SymbolicState:
         st.unknown_reason = self.unknown_reason
         return st
 
-    def get_register(self, reg_offset: int, size: int = 8) -> z3.BitVecRef:
+    def get_register(self, reg_offset: Union[int, str], size: int = 8) -> z3.BitVecRef:
         """Gets or lazily creates a symbolic register."""
+        if isinstance(reg_offset, str):
+            reg_offset = CANONICAL_REG_OFFSETS.get(reg_offset.lower(), 0x800)
         if reg_offset not in self.regs:
             if reg_offset >= 0x700:
                 flag_names = {0x700: "flag_n", 0x701: "flag_z", 0x702: "flag_c", 0x703: "flag_v"}
@@ -226,8 +243,10 @@ class SymbolicState:
         else:
             return z3.ZeroExt(target_bits - val_reg.size(), val_reg)
 
-    def set_register(self, reg_offset: int, val: z3.BitVecRef, size: int = 8) -> None:
+    def set_register(self, reg_offset: Union[int, str], val: z3.BitVecRef, size: int = 8) -> None:
         """Sets a register, with 32-bit writes automatically zero-extended to 64-bit."""
+        if isinstance(reg_offset, str):
+            reg_offset = CANONICAL_REG_OFFSETS.get(reg_offset.lower(), 0x800)
         if val.size() < size * 8:
             val = z3.ZeroExt(size * 8 - val.size(), val)
         elif val.size() > size * 8:
@@ -611,6 +630,48 @@ class PcodeSymbolicSimulator:
             zero = z3.BitVecVal(0, v0.size())
             ovf = z3.Or(z3.And(v0 >= zero, v1 < zero, d < zero), z3.And(v0 < zero, v1 >= zero, d >= zero))
             res = z3.If(ovf, z3.BitVecVal(1, out_sz), z3.BitVecVal(0, out_sz))
+            if output:
+                state.set_varnode_value(output, res)
+
+        elif opcode == PcodeOpcode.BOOL_NEGATE:
+            v0 = state.get_varnode_value(inputs[0])
+            out_sz = output.size * 8 if output else 8
+            res = z3.If(v0 == 0, z3.BitVecVal(1, out_sz), z3.BitVecVal(0, out_sz))
+            if output:
+                state.set_varnode_value(output, res)
+
+        elif opcode == PcodeOpcode.BOOL_XOR:
+            v0 = state.get_varnode_value(inputs[0])
+            v1 = state.get_varnode_value(inputs[1])
+            out_sz = output.size * 8 if output else 8
+            res = z3.If(z3.Xor(v0 != 0, v1 != 0), z3.BitVecVal(1, out_sz), z3.BitVecVal(0, out_sz))
+            if output:
+                state.set_varnode_value(output, res)
+
+        elif opcode == PcodeOpcode.BOOL_AND:
+            v0 = state.get_varnode_value(inputs[0])
+            v1 = state.get_varnode_value(inputs[1])
+            out_sz = output.size * 8 if output else 8
+            res = z3.If(z3.And(v0 != 0, v1 != 0), z3.BitVecVal(1, out_sz), z3.BitVecVal(0, out_sz))
+            if output:
+                state.set_varnode_value(output, res)
+
+        elif opcode == PcodeOpcode.BOOL_OR:
+            v0 = state.get_varnode_value(inputs[0])
+            v1 = state.get_varnode_value(inputs[1])
+            out_sz = output.size * 8 if output else 8
+            res = z3.If(z3.Or(v0 != 0, v1 != 0), z3.BitVecVal(1, out_sz), z3.BitVecVal(0, out_sz))
+            if output:
+                state.set_varnode_value(output, res)
+
+        elif opcode == PcodeOpcode.POPCOUNT:
+            v0 = state.get_varnode_value(inputs[0])
+            out_sz = output.size * 8 if output else 8
+            bits = [
+                z3.ZeroExt(out_sz - 1, z3.Extract(i, i, v0)) if out_sz > 1 else z3.Extract(i, i, v0)
+                for i in range(v0.size())
+            ]
+            res = sum(bits[1:], bits[0]) if bits else z3.BitVecVal(0, out_sz)
             if output:
                 state.set_varnode_value(output, res)
 
@@ -1486,22 +1547,22 @@ class CSymbolicEvaluator:
     """Evaluates CASTNodes symbolically against SymbolicState."""
 
     _X86_64_REG_MAP: Dict[str, Tuple[int, int]] = {
-        "rax": (0, 8), "eax": (0, 4),
-        "rcx": (8, 8), "ecx": (8, 4),
-        "rdx": (16, 8), "edx": (16, 4),
-        "rbx": (24, 8), "ebx": (24, 4),
-        "rsp": (32, 8), "esp": (32, 4),
-        "rbp": (40, 8), "ebp": (40, 4),
-        "rsi": (48, 8), "esi": (48, 4),
-        "rdi": (56, 8), "edi": (56, 4),
-        "r8": (64, 8), "r8d": (64, 4),
-        "r9": (72, 8), "r9d": (72, 4),
-        "r10": (80, 8), "r10d": (80, 4),
-        "r11": (88, 8), "r11d": (88, 4),
-        "r12": (96, 8), "r12d": (96, 4),
-        "r13": (104, 8), "r13d": (104, 4),
-        "r14": (112, 8), "r14d": (112, 4),
-        "r15": (120, 8), "r15d": (120, 4),
+        "rax": (0, 8), "eax": (0, 4), "ax": (0, 2), "al": (0, 1),
+        "rcx": (8, 8), "ecx": (8, 4), "cx": (8, 2), "cl": (8, 1),
+        "rdx": (16, 8), "edx": (16, 4), "dx": (16, 2), "dl": (16, 1),
+        "rbx": (24, 8), "ebx": (24, 4), "bx": (24, 2), "bl": (24, 1),
+        "rsp": (32, 8), "esp": (32, 4), "sp": (32, 8), "spl": (32, 1),
+        "rbp": (40, 8), "ebp": (40, 4), "bp": (40, 2), "bpl": (40, 1),
+        "rsi": (48, 8), "esi": (48, 4), "si": (48, 2), "sil": (48, 1),
+        "rdi": (56, 8), "edi": (56, 4), "di": (56, 2), "dil": (56, 1),
+        "r8": (64, 8), "r8d": (64, 4), "r8w": (64, 2), "r8b": (64, 1),
+        "r9": (72, 8), "r9d": (72, 4), "r9w": (72, 2), "r9b": (72, 1),
+        "r10": (80, 8), "r10d": (80, 4), "r10w": (80, 2), "r10b": (80, 1),
+        "r11": (88, 8), "r11d": (88, 4), "r11w": (88, 2), "r11b": (88, 1),
+        "r12": (96, 8), "r12d": (96, 4), "r12w": (96, 2), "r12b": (96, 1),
+        "r13": (104, 8), "r13d": (104, 4), "r13w": (104, 2), "r13b": (104, 1),
+        "r14": (112, 8), "r14d": (112, 4), "r14w": (112, 2), "r14b": (112, 1),
+        "r15": (120, 8), "r15d": (120, 4), "r15w": (120, 2), "r15b": (120, 1),
     }
 
     def __init__(self):
@@ -1999,6 +2060,148 @@ class SMTPcodeVerifier:
                 equivalent=False,
                 status="UNKNOWN",
                 details=f"SMT Solver returned UNKNOWN (timeout or non-linear constraint: {reason})",
+            )
+
+    def verify_byte_sequences(
+        self,
+        bytes_a: bytes,
+        bytes_b: bytes,
+        arch: str = "arm64",
+        base_addr: int = 0x1000,
+        output_regs: Optional[List[str]] = None,
+        backend: str = "auto",
+        check_memory: bool = True,
+    ) -> EquivalenceResult:
+        """
+        Lifts two machine byte sequences (`bytes_a` and `bytes_b`) via `UnifiedPcodeLifter`
+        for `arch` (`"arm64"`, `"x86_64"`, or `"x86"`) and proves or refutes their semantic
+        equivalence using Z3 bit-vector SMT solving.
+        """
+        if not bytes_a or not bytes_b:
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=False,
+                status="UNKNOWN",
+                details="Empty byte sequence provided for SMT equivalence verification.",
+            )
+
+        lifter = UnifiedPcodeLifter(arch=arch, backend=backend)
+        ops_a, backend_a = lifter.lift_with_provenance(bytes_a, base_addr=base_addr, backend=backend)
+        ops_b, _ = lifter.lift_with_provenance(bytes_b, base_addr=base_addr, backend=backend)
+
+        if not ops_a or not ops_b:
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=False,
+                status="UNKNOWN",
+                details="Lifter produced no P-code operations for byte sequence.",
+                backend_used=backend_a,
+            )
+
+        base_state = SymbolicState(name_prefix="")
+        num_gprs = 32 if lifter.arch == "arm64" else 16
+        for i in range(num_gprs):
+            base_state.get_register(i * 8, 8)
+
+        state_a = base_state.clone()
+        self.pcode_sim.execute_block(state_a, ops_a)
+
+        state_b = base_state.clone()
+        self.pcode_sim.execute_block(state_b, ops_b)
+
+        if state_a.is_unknown or state_b.is_unknown:
+            reason = state_a.unknown_reason or state_b.unknown_reason or "Unknown operation encountered"
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=False,
+                status="UNKNOWN",
+                details=f"SMT Equivalence Undecidable: {reason}",
+                pcode_out=str(state_a.get_register(0, 8)),
+                c_out=str(state_b.get_register(0, 8)),
+                backend_used=backend_a,
+            )
+
+        target_regs: List[Tuple[int, int]] = []
+        if output_regs:
+            for r_spec in output_regs:
+                if isinstance(r_spec, int):
+                    target_regs.append((r_spec, 8))
+                else:
+                    resolved = self.c_eval._resolve_var_target(base_state, str(r_spec))
+                    if resolved is not None:
+                        target_regs.append(resolved)
+                    elif str(r_spec).lower() in CANONICAL_REG_OFFSETS:
+                        target_regs.append((CANONICAL_REG_OFFSETS[str(r_spec).lower()], 8))
+                    else:
+                        return VerificationResult(
+                            obligation_id=None,
+                            equivalent=False,
+                            status="UNKNOWN",
+                            details=f"Unrecognized output register '{r_spec}' for arch '{arch}'.",
+                            backend_used=backend_a,
+                        )
+        else:
+            written_gprs: Set[int] = set()
+            for op in ops_a + ops_b:
+                if op.output and op.output.space == AddressSpace.REGISTER and isinstance(op.output.offset, int):
+                    if 0 <= op.output.offset < 0x100:
+                        written_gprs.add(op.output.offset)
+            if not written_gprs:
+                written_gprs.add(0)
+            for off in sorted(written_gprs):
+                target_regs.append((off, 8))
+
+        solver = z3.Solver()
+        solver.set("timeout", self.timeout_ms)
+
+        equiv_conditions: List[z3.BoolRef] = []
+        for reg_off, reg_sz in target_regs:
+            va = state_a.get_register(reg_off, reg_sz)
+            vb = state_b.get_register(reg_off, reg_sz)
+            equiv_conditions.append(va == vb)
+
+        if check_memory:
+            equiv_conditions.append(state_a.mem == state_b.mem)
+
+        solver.add(z3.Not(z3.And(*equiv_conditions)))
+        check_res = solver.check()
+
+        primary_off, primary_sz = target_regs[0] if target_regs else (0, 8)
+        out_a_str = str(state_a.get_register(primary_off, primary_sz))
+        out_b_str = str(state_b.get_register(primary_off, primary_sz))
+
+        if check_res == z3.unsat:
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=True,
+                status="UNSAT",
+                details=f"Formally proven equivalent across {arch} byte sequences via {backend_a} lifter.",
+                pcode_out=out_a_str,
+                c_out=out_b_str,
+                backend_used=backend_a,
+            )
+        elif check_res == z3.sat:
+            model = solver.model()
+            cex: Dict[str, Any] = {d.name(): str(model[d]) for d in model.decls()}
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=False,
+                status="SAT",
+                details="SMT Divergence Detected: Found counterexample inputs producing non-equivalent outputs.",
+                counterexample=cex,
+                model_inputs=cex,
+                pcode_out=out_a_str,
+                c_out=out_b_str,
+                backend_used=backend_a,
+            )
+        else:
+            reason = solver.reason_unknown()
+            return VerificationResult(
+                obligation_id=None,
+                equivalent=False,
+                status="UNKNOWN",
+                details=f"SMT Solver returned UNKNOWN (timeout or non-linear constraint: {reason})",
+                backend_used=backend_a,
             )
 
     def verify_obligation(self, obligation: ProofObligation) -> VerificationResult:

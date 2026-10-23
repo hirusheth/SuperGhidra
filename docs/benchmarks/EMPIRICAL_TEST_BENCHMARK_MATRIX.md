@@ -108,13 +108,18 @@ For continuity with prior literature, the HumanEval-Decompile corpus (binaries b
 <!-- humaneval:begin -->
 | Metric | IDA raw | IDA + filter | Ghidra raw | Ghidra + filter |
 | :--- | :---: | :---: | :---: | :---: |
-| **Pass Rate** | 243/1300 (18.69%) | 247/1300 (19.0%) | 107/1300 (8.23%) | 294/1300 (22.62%) |
-| **Filter Gains** | — | +4 | — | +187 |
+| **Pass Rate (Full Corpus)** | 243/1300 (18.69%) | 247/1300 (19.0%) | 107/1300 (8.23%) | 294/1300 (22.62%) |
+| **70% Train Split (230 funcs)** | 197/912 (21.6%) | 201/912 (22.04%) | 64/912 (7.02%) | 196/912 (21.49%) |
+| **30% Held-Out Test Split (Function-Disjoint, 98 funcs)** | 46/388 (11.86%) | 46/388 (11.86%) | 43/388 (11.08%) | 98/388 (25.26%) |
+| **Held-Out Test (`O2`/`O3` High-Opt)** | 20/194 (10.31%) | 20/194 (10.31%) | 18/194 (9.28%) | 48/194 (24.74%) |
+| **Filter Gains** | — | +4 | — | +187 (+55 held-out) |
 | **Filter Regressions** | — | -0 | — | -0 |
 
 - **Dataset:** `LLM4Binary/decompile-eval@b9271fae3c556e46948559f4176ffa6f8b4f9491` (1300 evaluable functions from binaries compiled at `O0`–`O3`).
 - **Compiler & Host:** Evaluated on `Windows AMD64` by recompiling recovered C/C++ with `gcc.EXE (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r3) 16.2.0` under `gcc -O0 -lm`.
 - **Host ABI Note:** Single-host evaluation. Linux ELF binaries recompiled on Windows (LLP64) experience 32-bit `long` truncation on raw Ghidra emissions (8.23%). On Linux (LP64), raw Ghidra achieves 21.46% (279/1300), exceeding raw IDA.
+- **Methodology & Scope Caveat:** Measures syntactic recompilability (`gcc -O0 -lm`) + unit test pass rate via deterministic AST/token rewriting (`CompilableDecompilerFilter` + `defs.h` compatibility macros), not neural LLM weight generation.
+- **70/30 Held-Out Split:** Splitting by unique function body (seed `42`, all `O0`–`O3` variants of a function kept together) confirms out-of-sample generalization on the held-out 30% test split (43/388 -> 98/388, +55 gains) with zero regressions.
 <!-- humaneval:end -->
 
 ---

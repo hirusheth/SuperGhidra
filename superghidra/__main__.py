@@ -3,7 +3,7 @@ superghidra.__main__
 ====================
 
 Unified CLI entry point for SuperGhidra:
-High-Performance Autonomous Reverse Engineering & Decompiler Suite.
+SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="superghidra",
-        description="SuperGhidra: High-Performance Autonomous Decompiler & Reverse Engineering Suite",
+        description="SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite",
     )
     parser.add_argument(
         "-v", "--version", action="store_true", help="Show SuperGhidra version and environment"
@@ -69,6 +69,8 @@ def create_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--out", "-o", type=Path, help="Output Ghidra Python script path")
     sync_parser.add_argument("--diff", action="store_true", help="Print summary diff report instead of generating script")
     sync_parser.add_argument("--dry-run", action="store_true", help="Configure generated script for dry run")
+    sync_parser.add_argument("--watch", action="store_true", help="Generate a live CodeBrowser background watcher script")
+    sync_parser.add_argument("--poll-ms", type=int, default=1000, help="Polling interval in ms for --watch mode (default: 1000)")
 
     return parser
 
@@ -290,7 +292,14 @@ def cmd_overlay_sync(args: argparse.Namespace) -> int:
         print(report)
         return 0
 
-    script = bridge.generate_ghidra_python_script(dry_run=args.dry_run)
+    if getattr(args, "watch", False) and hasattr(bridge, "generate_ghidra_watcher_script"):
+        script = bridge.generate_ghidra_watcher_script(
+            poll_interval_ms=getattr(args, "poll_ms", 1000),
+            dry_run=args.dry_run,
+        )
+    else:
+        script = bridge.generate_ghidra_python_script(dry_run=args.dry_run)
+
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(script, encoding="utf-8")

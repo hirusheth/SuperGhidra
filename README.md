@@ -5,7 +5,9 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB.svg)](https://www.python.org/)
 [![CI](https://github.com/yuatemycat/SuperGhidra/actions/workflows/ci.yml/badge.svg)](https://github.com/yuatemycat/SuperGhidra/actions/workflows/ci.yml)
 
-Python tools that make Ghidra faster to script against, plus a few analyses it doesn't do out of the box: MFC/C++ class recovery, `Serialize()` layout tracing, cross-version function matching, and a Z3 equivalence checker for P-code.
+**SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite.**
+
+Python tools that make Ghidra faster to script against, rewrite raw decompiler output into compilable C, and run static binary analyses Ghidra does not include out of the box: MSVC RTTI and MFC `CRuntimeClass` recovery, `Serialize()` archive layout tracing, cross-version function and struct-shift matching, and a Z3 equivalence checker for P-code.
 
 Instead of paying 5–15 seconds of JVM startup per headless run or fighting `.rep` project lock contention while the Ghidra GUI is open, SuperGhidra keeps a single read-only Ghidra instance warm in a background daemon (`127.0.0.1:5073`) backed by an L2 SQLite cache and a non-destructive JSON write overlay. Heavy binary sweeps and class-layout recovery run in pure Python, NumPy SIMD, or WGPU compute shaders without touching the JVM.
 
@@ -71,6 +73,9 @@ Ghidra locks `.rep` projects exclusively, meaning standard headless scripts fail
 
 ## 5-Minute End-to-End Quickstart
 
+> [!TIP]
+> **2-Minute End-to-End Walkthrough:** Follow [`docs/WALKTHROUGH_MSVC_MFC_RECOVERY.md`](docs/WALKTHROUGH_MSVC_MFC_RECOVERY.md) for a step-by-step example recovering MSVC RTTI and MFC `Serialize()` archive layouts, validating candidate renames through `ReconstructionObligationLedger`, and syncing them live into an open Ghidra CodeBrowser window (`superghidra overlay-sync --watch`).
+
 ### Workflow A: Standalone C++ / MSVC / MFC Class Recovery (No Ghidra Required)
 
 Recover MSVC RTTI hierarchies, MFC `CRuntimeClass` descriptors, and virtual function tables directly from raw PE binaries without requiring Ghidra or a JVM:
@@ -135,9 +140,13 @@ python ghidra_oracle.py comment 0x140001000 "Validated packet parser entry point
 Mutations are recorded in `ghidra_overlay.json` to prevent `.rep` lock collisions. Sync them back into the Ghidra GUI session:
 
 * **Option 1 — Live Ghidra GUI Sync (`ghidra_gui_overlay_sync.py`):**
-  1. Generate the sync script:
+  1. Generate a one-shot sync script or a live background watcher (`--watch`):
      ```bash
+     # One-shot atomic transaction script
      superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py
+
+     # Or generate a continuous background watcher script (polls every 1000 ms)
+     superghidra overlay-sync --overlay ghidra_overlay.json --watch --poll-ms 1000 --out ghidra_gui_overlay_sync.py
      ```
   2. In Ghidra's CodeBrowser, navigate to **Window → Script Manager**.
   3. Add the output directory to Script Paths and run `ghidra_gui_overlay_sync.py`. All renames, comments, and type definitions apply atomically inside your active GUI session.
@@ -229,15 +238,26 @@ If running the server via HTTP (`superghidra-mcp --transport streamable-http --p
 
 ## Subsystem Capabilities & Hardware Matrix
 
+### 1. Core Production Toolkit
+
+These subsystems form the daily-driver reverse-engineering, C rewriting, and agent-guardrail workflow:
+
 | Package / Subsystem | What It Does | Hardware / Dependency Behavior |
 | :--- | :--- | :--- |
-| **`core` (Daemon & Cache)** | Persistent RPC server on `127.0.0.1:5073`, 64 KB shared-memory ring buffer (`5.12 µs` IPC), SQLite L2 cache (`>100k req/s`), JSON write overlay, and resource governor (`eco` / `balanced` / `turbo` / `auto`). | Runs on all platforms (Windows/Linux/macOS). Requires PyGhidra + OpenJDK 21 only when attached to a live `.rep`. |
-| **Binary & C++ Recovery (`formats`)** | ELF / PE / Mach-O loader, MSVC RTTI & MFC `CRuntimeClass` recovery, `Serialize()` layout tracing, `CArchive` decoder, PDB MSF 7.0 / GSI hash stream and TPI CodeView leaf type records, DWARF 5 / Breakpad / `.map` export. | Pure Python; zero JVM or Ghidra dependency. |
-| **Lifter & Z3 Prover (`[smt]`)** | Pure-Python ARM64 → P-code lifter (integer, exclusive memory, SIMD vector arithmetic, ARMv8.1-A atomics), x86/ARM/Thumb decoders, and Z3 equivalence prover for testing whether decompiled C matches lifted IR. | Requires `z3-solver`. **By design, returns `UNKNOWN` instead of guessing** on floating-point ops, unhandled instructions, or unbounded loops. |
-| **GPU / SIMD ARM64 Scanner (`[gpu]`)** | Scans ARM64 binaries for `ADRP + ADD/LDR` pairs and function prologues (`20 MB` / `5.2M` insns in `41.20 ms` = `127.25 M insn/s` on RTX A5500). | Uses WGPU (DirectX 12 / Vulkan / Metal) for blocks ≥ 5 MB. **Automatically falls back to NumPy CPU SIMD** (`143.95 M insn/s` on 4 MB blocks) when < 5 MB or when no GPU is present. |
-| **Cross-Version Matcher (`diff`)** | Matches functions across binary builds using CFG feature vectors, detects shifted struct field offsets, and rewrites field accesses. | Runs on CPU (NumPy accelerated). |
-| **Storage Codec (`[storage]`)** | Compresses Ghidra 16 KB `BufferFile` pages using LZ4 (`442.9 MB/s`, `79.32%` savings) or Zstd Level 3 (`206.5 MB/s`, `86.47%` savings). | Requires `lz4` and `zstandard` packages; includes standalone Java `BufferFile` codec. |
-| **Mobile & LLM Naming (`[frida]`)** | APK ↔ JNI cross-referencer, allow-listed Android emulator memory reader, and guarded LLM symbol/struct naming pipeline. | Commits symbols/structs **only** after automated validation of vtable slots, field offsets, and allocation sizes. |
+| **`core` (Daemon, Cache, Overlay & `CompilableDecompilerFilter`)** | Persistent RPC server on `127.0.0.1:5073`, 64 KB shared-memory ring buffer (`5.12 µs` IPC), SQLite L2 cache (`>100k req/s`), JSON write overlay (`ghidra_overlay.json`), conflict-aware `merge_fork`, deterministic `CompilableDecompilerFilter` C rewriter, and resource governor (`eco` / `balanced` / `turbo` / `auto`). | Runs on Windows, Linux, and macOS. `CompilableDecompilerFilter` is pure Python; PyGhidra + OpenJDK 21 are required only when attached to a live `.rep`. |
+| **`formats` (Binary Loader, MSVC RTTI, MFC `Serialize()` & PDB/DWARF5)** | ELF / PE / Mach-O loader, MSVC RTTI & MFC `CRuntimeClass` recovery, `Serialize()` layout tracing, `CArchive` stream decoder, PDB MSF 7.0 / GSI hash stream and TPI CodeView leaf type records, and DWARF 5 / Breakpad / `.map` export. | Pure Python; no JVM or Ghidra dependency. |
+| **`diff` (Cross-Version CFG Matcher & Struct Shift Migrator)** | Matches functions across binary builds using CFG feature vectors, detects shifted struct field offsets across patches, and rewrites displaced field accesses. | Runs on CPU (NumPy accelerated). |
+| **`integrations` (38+ Guardrailed MCP Tools & Mobile Sidecar)** | Exposes 38+ MCP tools (`SuperghidraMCP`), APK ↔ JNI cross-referencer, allow-listed Android emulator memory reader, live CodeBrowser overlay sync (`ghidra_gui_overlay_sync.py`), and `ReconstructionObligationLedger` commit guards (`VTableSlotVerifier`, `FieldDisplacementVerifier`, `AllocationSizeVerifier`). | Commits symbols and structs **only** after deterministic verification of vtable slots, field displacements, and allocation sizes. |
+
+### 2. Optional & Experimental Backends
+
+These modules target specific scale bottlenecks or standalone verification tasks and have explicit scope boundaries:
+
+| Package / Subsystem | What It Does | Scope & Hardware Caveats |
+| :--- | :--- | :--- |
+| **`storage` (`[storage]` — Synthetic 16 KB Page Codec)** | Compresses 16 KB `BufferFile` pages using LZ4 (`442.9 MB/s`, `79.32%` savings) or Zstd Level 3 (`206.5 MB/s`, `86.47%` savings) and packages `SuperGhidraCodec.jar`. | **Experimental / External `.sgdb` only:** Measured on synthetic pages from `GhidraPageSimulator`. Ghidra hardcodes `LocalManagedBufferFile` without an SPI hook, so it does not transparently compress live `.rep` `.gbf` databases without patching Ghidra's jar. |
+| **`acceleration` (`[gpu]` — 20 MB+ WGPU ARM64 Sweeps)** | Scans large ARM64 binaries for `ADRP + ADD/LDR` pairs and function prologues (`20 MB` / `5.2M` insns in `41.20 ms` = `127.25 M insn/s` on RTX A5500). | **Optional for ≥ 5 MB binaries:** Below ~5–10 MB, PCIe transfer latency exceeds shader execution time, so `gpu_adrp_scanner` automatically routes `< 5 MB` inputs to NumPy CPU SIMD (`143.95 M insn/s` on 4 MB blocks). |
+| **`lifters` (`[smt]` — Zero-JVM P-Code Lifter & Z3 Prover)** | Pure-Python ARM64/x86_64 → P-code lifter (integer, exclusive memory, SIMD vector math, ARMv8.1-A atomics) and Z3 equivalence prover (`SMTPcodeVerifier`). | **Bounded Subset / Sound `UNKNOWN`:** Standalone lifting covers bounded instruction subsets; `SMTPcodeVerifier` intentionally returns `UNKNOWN` (`equivalent=False`) on floating-point ops, unhandled instructions, or loops exceeding the unroll bound. |
 
 Each package has its own README under [`superghidra/`](superghidra/).
 
@@ -256,6 +276,10 @@ All benchmarks are measured on physical hardware (Intel Core i9-12950HX, 64 GB D
 | **Buffer File Compression (Zstd)** | 1,000 synthetic 16 KB pages (16.0 MB) | Zstd Level 3 | **77.48 ms** | **206.5 MB/s** (7.39x ratio) | 86.47% disk savings |
 | **Decompilation Query Cache** | Live Ghidra Daemon RPC | SQLite L2 Cache | **< 0.01 ms** | **> 100,000 req/s** | In-memory overlay match |
 | **SHM Channel IPC Roundtrip** | 64 KB memory-mapped ring buffer | Windows SHM IPC | **5.12 µs** | **195,300 msg/s** | Zero-copy shared memory |
+
+**Benchmark Caveats:**
+- **CPU SIMD vs. WGPU Crossover:** Below ~5–10 MB, NumPy CPU SIMD (`143.95 M insn/s` on 4 MB blocks) outperforms WGPU DirectX 12 (`127.25 M insn/s` on 20 MB blocks) because PCIe host-to-device transfer overhead exceeds shader execution time. `gpu_adrp_scanner` automatically routes `< 5 MB` inputs to the CPU SIMD path.
+- **Synthetic Storage Pages:** The 16 KB `BufferFile` compression figures (`442.9 MB/s` LZ4, `206.5 MB/s` Zstd) are measured on 1,000 synthetic pages generated by `GhidraPageSimulator`, not on live `.rep` `.gbf` databases (Ghidra hardcodes `LocalManagedBufferFile` without an SPI hook).
 
 ### Out-of-Distribution Systems Matrix (Uncontaminated Decompilation Verification)
 
@@ -277,14 +301,21 @@ Addresses the dataset contamination problem in neural decompiler benchmarks (suc
 <!-- humaneval:begin -->
 | Metric | IDA raw | IDA + filter | Ghidra raw | Ghidra + filter |
 | :--- | :---: | :---: | :---: | :---: |
-| **Pass Rate** | 243/1300 (18.69%) | 247/1300 (19.0%) | 107/1300 (8.23%) | 294/1300 (22.62%) |
-| **Filter Gains** | — | +4 | — | +187 |
+| **Pass Rate (Full Corpus)** | 243/1300 (18.69%) | 247/1300 (19.0%) | 107/1300 (8.23%) | 294/1300 (22.62%) |
+| **70% Train Split (230 funcs)** | 197/912 (21.6%) | 201/912 (22.04%) | 64/912 (7.02%) | 196/912 (21.49%) |
+| **30% Held-Out Test Split (Function-Disjoint, 98 funcs)** | 46/388 (11.86%) | 46/388 (11.86%) | 43/388 (11.08%) | 98/388 (25.26%) |
+| **Held-Out Test (`O2`/`O3` High-Opt)** | 20/194 (10.31%) | 20/194 (10.31%) | 18/194 (9.28%) | 48/194 (24.74%) |
+| **Filter Gains** | — | +4 | — | +187 (+55 held-out) |
 | **Filter Regressions** | — | -0 | — | -0 |
 
 - **Dataset:** `LLM4Binary/decompile-eval@b9271fae3c556e46948559f4176ffa6f8b4f9491` (1300 evaluable functions from binaries compiled at `O0`–`O3`).
 - **Compiler & Host:** Evaluated on `Windows AMD64` by recompiling recovered C/C++ with `gcc.EXE (MinGW-W64 x86_64-ucrt-posix-seh, built by Brecht Sanders, r3) 16.2.0` under `gcc -O0 -lm`.
 - **Host ABI Note:** Single-host evaluation. Linux ELF binaries recompiled on Windows (LLP64) experience 32-bit `long` truncation on raw Ghidra emissions (8.23%). On Linux (LP64), raw Ghidra achieves 21.46% (279/1300), exceeding raw IDA.
+- **Methodology & Scope Caveat:** Measures syntactic recompilability (`gcc -O0 -lm`) + unit test pass rate via deterministic AST/token rewriting (`CompilableDecompilerFilter` + `defs.h` compatibility macros), not neural LLM weight generation.
+- **70/30 Held-Out Split:** Splitting by unique function body (seed `42`, all `O0`–`O3` variants of a function kept together) confirms out-of-sample generalization on the held-out 30% test split (43/388 -> 98/388, +55 gains) with zero regressions.
 <!-- humaneval:end -->
+
+> **HumanEval-Decompile Caveat (Deterministic C Rewriter, Not Neural Inference):** The `22.62%` (`294/1,300` full corpus, plus `25.26%` on the 30% function-disjoint held-out test split) score measures syntactic recompilability and unit-test execution pass rate produced by [`CompilableDecompilerFilter`](superghidra/core/compilable_filter.py) — a deterministic post-processing rewriter that strips stack-canary boilerplate, normalizes Ghidra pseudo-types (`undefined8`, `CONCAT44`, `SUB84`), and injects symmetric Hex-Rays `defs.h` compatibility macros (`__int64`, `LODWORD`, `HIDWORD`, `BYTEn`) for IDA Pro baselines. No neural model weights or LLM calls are invoked in this benchmark.
 
 ### Dual-OS Test Matrix (GitHub Actions CI)
 
@@ -348,8 +379,8 @@ superghidra rtti-recover app.dll -o classes.json
 # Filter raw decompiler output into clean, compilable C
 superghidra filter raw_decompile.c -o clean.c
 
-# Sync JSON write overlays and delta logs into an atomic Ghidra GUI Python script
-superghidra overlay-sync --overlay ghidra_overlay.json --out sync_script.py
+# Sync JSON write overlays and delta logs into an atomic Ghidra GUI Python script (add --watch for live polling)
+superghidra overlay-sync --overlay ghidra_overlay.json --watch --out sync_script.py
 ```
 
 **Inspect a Windows binary (no Ghidra needed):**
@@ -394,7 +425,7 @@ print(sg.SMTPcodeVerifier().verify_equivalence(ops, ops).equivalent)
 * **`LockException: Project is locked by another process`:**
   Your `.rep` project is currently open in the Ghidra GUI. The daemon reads from the project without acquiring exclusive locks; if Ghidra holds an exclusive lock or you encounter lock contention, ensure the daemon uses a read-only session or private session fork, and sync changes back via `superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py`.
 * **My renamed functions in the daemon don't show up in the Ghidra GUI:**
-  Daemon writes go to the JSON overlay (`ghidra_overlay.json`) to prevent `.rep` corruption. Run `superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py` and execute that script inside Ghidra's Script Manager, or close the GUI and run `merge_fork`.
+  Daemon writes go to the JSON overlay (`ghidra_overlay.json`) to prevent `.rep` corruption. Run `superghidra overlay-sync --overlay ghidra_overlay.json --out ghidra_gui_overlay_sync.py` (or pass `--watch` for continuous background polling) and execute that script inside Ghidra's Script Manager, or close the GUI and run `merge_fork`.
 * **Z3 Equivalence Checker returns `UNKNOWN`:**
   This is expected behavior, not a crash. The prover returns `UNKNOWN` whenever a block contains floating-point instructions, unmodeled system instructions, or long loops so an agent never commits a false-positive equivalence rewrite.
 * **WGPU scanner says `Using CPU SIMD path` even with `[gpu]` installed:**

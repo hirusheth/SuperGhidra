@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-SuperGhidra Section 4 Head-to-Head Matrix, Diff Domain & Next-Gen Engine
-=========================================================================
+STATUS: Experimental research prototype.
 
-Reference Implementation for:
-  - Section 4: Head-to-Head Architectural Comparison Matrix (12-Capability Parity
-    & Performance Harness + the 5 "SUPERGHIDRA WINS" Subsystems)
-  - Domain 4 (`superghidra/diff/`): 32-Dim CFG Cosine Graph Diffing, Cross-Version
-    Struct Field Displacement Shift Migrator, and SHA-256 `.ghidra-delta.jsonl`
-    Audit Logger
-  - Section 7.4 (Kill-Shot 4): Whole-Program Global Type Lattice Solver (Retypd),
-    Cross-Boundary Android DEX <-> NDK `RegisterNatives` Unified Graph, and
-    Zero-Heuristic C++ STL / Rust Monomorphized Container Recognizer
-  - Executive Summary Item 4 (Phase 2 Leapfrog Engine): Equality Saturation
-    (`egglog`-style E-Graph MBA Simplifier + `Rellic` Goto-Free Restructuring)
-    and `D-LiFT` 3-Gate Self-Verifying Neural Decompilation ($R_syn$, $R_sem$, $R_read$)
+Core production modules live in `ghidra_oracle.py`, `compilable_filter.py`,
+`binary_diff_engine.py`, and `struct_shift_migrator.py`. By contrast,
+`mitigation_roadmap_engine.py`, `phase1_phase2_roadmap_engine.py`, and
+`benchmark_and_nextgen_engine.py` are experimental research and simulation
+prototypes used to test multi-agent forking, type propagation, MBA rewriting,
+and comparison scorecard harnesses in isolation:
+
+  - `CRDTSessionForkManager`: In-memory copy-on-write session forks with a
+    semilattice join (`TypeConfidenceTier`, instruction-evidence tie-breaker,
+    and timestamp fallback) for merging field types and symbol renames.
+  - `CrossVersionDiffEngine`: Pairs 32-dimensional CFG vectors by cosine
+    similarity, detects struct field displacement shifts between function
+    versions, and appends SHA-256 hash-chained records to an in-memory log.
+  - `GlobalTypeLatticeSolver` & `AndroidJNIFusionGraph`: Fixed-point type
+    constraint propagation across variables/fields and JNI signature decoding
+    into AAPCS64 `__usercall` prototypes.
+  - `EGraphMBASimplifier` & `DLiFTVerificationGate`: Rewrite rules for linear
+    mixed boolean-arithmetic (MBA) expressions and a 3-stage check (`R_syn`,
+    `R_sem`, `R_read`) delegating to `superghidra.integrations.d_lift_verifier`.
+  - `Section4ComparisonMatrixHarness`: Synthetic 12-row scorecard runner.
 """
 
 from __future__ import annotations
@@ -32,22 +39,18 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 import numpy as np
 
 
-# =============================================================================
-# 1. SECTION 4 "SUPERGHIDRA WINS": CRDT SESSION FORKING & SYMBOLIC TIE-BREAKER
-# =============================================================================
-
 class TypeConfidenceTier(enum.IntEnum):
     """Lattice rank for resolving concurrent multi-agent type mutations."""
     UNKNOWN = 0
     HEURISTIC_NAME = 1        # Inferred from string/naming convention
     DATAFLOW_XREF = 2         # Inferred from API call (e.g., strlen -> char*)
     INSTRUCTION_SEMANTIC = 3  # Inferred from typed instruction (e.g., FADD -> float)
-    DWARF_OR_SMT_PROVED = 4   # Formally proved via Z3 SMT or DWARF5 debug info
+    DWARF_OR_SMT_PROVED = 4   # Derived from Z3 SMT or DWARF5 debug info
 
 
 @dataclass(frozen=True)
 class FieldTypeFact:
-    """An atomic CRDT lattice element describing a struct field at a byte offset."""
+    """CRDT lattice element describing a struct field at a byte offset."""
     struct_name: str
     byte_offset: int
     c_type: str
@@ -60,7 +63,7 @@ class FieldTypeFact:
 
 @dataclass
 class SessionForkState:
-    """Isolated copy-on-write state for an autonomous MCP agent fork."""
+    """Copy-on-write state for an isolated session fork."""
     fork_id: str
     parent_fork_id: str
     agent_id: str
@@ -71,11 +74,9 @@ class SessionForkState:
 
 class CRDTSessionForkManager:
     """
-    Implements Section 4 'Multi-Agent Collaboration: Private Session Forks (merge_fork)'
-    and Section 7.6 'CRDT Speculative Agent Swarms':
-    Allows 50+ concurrent MCP agents to fork `.sgdb` state, mutate struct offsets and
-    function symbols without locks, and merge cleanly via a join-semilattice with
-    automatic instruction-semantic / SMT tie-breaking.
+    Manages in-memory copy-on-write session forks (`create_fork`, `merge_fork`,
+    `discard_fork`, `list_forks`, `prune_stale_forks`) and resolves conflicting
+    field type assertions via `_lattice_join`.
     """
 
     def __init__(self) -> None:
@@ -252,10 +253,6 @@ class CRDTSessionForkManager:
         }
 
 
-# =============================================================================
-# 2. DOMAIN 4 (`superghidra/diff/`): CROSS-VERSION DIFFING & SHIFT MIGRATOR
-# =============================================================================
-
 @dataclass
 class BinaryFunctionSummary:
     """Function representation for cross-version binary diffing."""
@@ -267,11 +264,9 @@ class BinaryFunctionSummary:
 
 class CrossVersionDiffEngine:
     """
-    Implements Domain 4 (`superghidra/diff/`):
-      1. 32-dimensional CFG cosine-similarity bipartite matcher across binary versions.
-      2. Automated struct field displacement shift detector & migrator (detecting when
-         inserted struct fields shift downstream offsets by +delta bytes).
-      3. Tamper-evident SHA-256 hash-chained `.ghidra-delta.jsonl` audit logger.
+    Matches functions across binary versions by 32-dimensional CFG cosine
+    similarity, detects struct field offset shifts between matched pairs, and
+    appends SHA-256 hash-chained records to an in-memory log.
     """
 
     def __init__(self) -> None:
@@ -392,10 +387,6 @@ class CrossVersionDiffEngine:
         return v / n if n > 1e-12 else v
 
 
-# =============================================================================
-# 3. SECTION 7.4 (KILL-SHOT 4): GLOBAL TYPE LATTICE, JNI FUSION & STL RECOVERY
-# =============================================================================
-
 class LatticeType(enum.IntEnum):
     """Algebraic type lattice ordered from TOP (most general) to BOTTOM (conflict)."""
     TOP_UNKNOWN = 0
@@ -422,9 +413,8 @@ class TypeConstraint:
 
 class GlobalTypeLatticeSolver:
     """
-    Implements Section 7.4 'Global Constraint-Graph Type Recovery':
-    Solves subtyping (`lhs <= rhs`) and structural field-offset constraints across
-    all functions in the binary simultaneously using fixed-point lattice propagation.
+    Propagates subtyping and field-offset constraints across variables using
+    fixed-point iteration (up to 64 passes).
     """
 
     def __init__(self) -> None:
@@ -527,10 +517,8 @@ class JNINativeMethodEntry:
 
 class AndroidJNIFusionGraph:
     """
-    Implements Section 7.4 'Cross-Boundary Android ART <-> NDK Fusion':
-    Parses JNI type descriptors (`(IJLjava/lang/String;)Z`) and fuses Dalvik/ART
-    `.dex` call sites with ARM64 `.so` `RegisterNatives` targets into a single
-    continuous inter-procedural call & type graph.
+    Parses JNI type descriptors (`(IJLjava/lang/String;)Z`) and maps
+    `JNINativeMethodEntry` bindings to AAPCS64 `__usercall` C prototypes.
     """
 
     JNI_TYPE_MAP = {
@@ -613,13 +601,9 @@ class AndroidJNIFusionGraph:
 AndroidJNIFusionEngine = AndroidJNIFusionGraph
 
 
-# =============================================================================
-# 4. PHASE 2 KILL-SHOTS 1 & 2: E-GRAPH MBA SIMPLIFIER & D-LiFT 3-GATE PROVER
-# =============================================================================
-
 @dataclass(frozen=True)
 class ExprNode:
-    """Immutable AST / E-Graph expression node for Mixed Boolean-Arithmetic (MBA)."""
+    """Immutable expression node for Mixed Boolean-Arithmetic (MBA) rewrite rules."""
     op: str                                    # 'var', 'const', '+', '-', '*', '&', '|', '^', '~'
     args: Tuple[Union[str, int, "ExprNode"], ...]
 
@@ -640,10 +624,9 @@ class ExprNode:
 
 class EGraphMBASimplifier:
     """
-    Implements Section 7.1 'Replace Sequential Microcode with Equality Saturation (E-Graphs)':
-    Maintains an equivalence class set of all algebraic/boolean-arithmetic rewrites
-    simultaneously without destructive phase-ordering, extracting the minimum-cost
-    expression and verifying bit-exact equivalence across 64-bit test vectors.
+    Applies linear Mixed Boolean-Arithmetic (MBA) rewrite rules over a bounded
+    equivalence set, selects the lowest-cost expression, and checks 64-bit
+    evaluation parity across fixed sample inputs.
     """
 
     @classmethod
@@ -873,13 +856,9 @@ class DLiFTVerificationGate:
         return max(0.0, min(1.0, 1.0 - penalty))
 
 
-# =============================================================================
-# 5. SECTION 4 ARCHITECTURAL COMPARISON MATRIX BENCHMARK HARNESS
-# =============================================================================
-
 @dataclass
 class MatrixCapabilityRow:
-    """Single row of the Section 4 Head-to-Head Architectural Comparison Matrix."""
+    """Single row of the Section 4 comparison matrix."""
     capability: str
     ida_pro_baseline: str
     superghidra_engine: str
@@ -950,9 +929,8 @@ def compute_matrix_verdicts(metrics: dict) -> dict:
 
 class Section4ComparisonMatrixHarness:
     """
-    Executes live benchmarks across all 12 capabilities in Section 4's
-    Head-to-Head Architectural Comparison Matrix and produces a quantitative
-    parity & superiority scorecard.
+    Runs synthetic in-memory checks across the 12 rows of the Section 4
+    comparison matrix and returns a summary dictionary.
     """
 
     @classmethod

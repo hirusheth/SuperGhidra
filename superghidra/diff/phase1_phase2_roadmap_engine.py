@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
 r"""
-SuperGhidra Sections 6 & 7: Phase 1 Parity & Phase 2 Next-Gen Kill-Shot Engine
-==============================================================================
+STATUS: Experimental research prototype.
 
-Reference Implementation for Section 6 ("Phase 1 Engineering Roadmap") and
-Section 7 ("Phase 2 Engineering Roadmap: Surpassing IDA Pro & Its 2026 Roadmap"):
+Core production modules live in `ghidra_oracle.py`, `compilable_filter.py`,
+`binary_diff_engine.py`, and `struct_shift_migrator.py`. By contrast,
+`mitigation_roadmap_engine.py`, `phase1_phase2_roadmap_engine.py`, and
+`benchmark_and_nextgen_engine.py` are experimental research and simulation
+prototypes used to test Section 6 and Section 7 design concepts in isolation:
 
-  1. Kill-Shot 1 — MLIR (`Patchestry`/`Rellic`) Tiered Lowering & 100% Goto-Free
-     Region Restructurer (`PatchestryMLIRPipeline` & `RellicGotoFreeRestructurer`):
-     Lowers P-Code through 3 MLIR dialects (`patchestry.low` -> `patchestry.ssa`
-     -> `hl.c_ast`) and applies region-based condition projection to emit
-     provably `goto`-free structured C/C++ code.
-  2. Kill-Shot 2 — `D-LiFT` GRPO Policy Trainer & 3-Gate Self-Verifying Neural
-     Decompiler (`DLiFTGRPOEngine`):
-     Computes Group Relative Policy Optimization (GRPO) group-normalized advantages
-     ($\hat{A}_i = \frac{D_i - \mu_D}{\sigma_D + \epsilon}$) over candidate LLM
-     decompilations gated by $R_{\text{syn}}$, $R_{\text{sem}}$ (Z3/bit-exact P-Code
-     equivalence), and $R_{\text{read}}$.
-  3. Kill-Shot 3 — CSR Sparse-Matrix Whole-Binary Value-Set Analysis (VSA) &
-     Indirect Call (`BLR x8`) Resolver (`CSRSparseMatrixVSAEngine`):
-     Represents whole-binary def-use and vtable pointer stride tables in
-     Compressed Sparse Row (CSR) format to resolve indirect virtual dispatch and
-     inter-procedural taint in milliseconds.
-  4. Kill-Shot 4 — Zero-Heuristic C++ STL & Rust Monomorphized Template Collapser
-     (`MonomorphizedTemplateCollapser`):
-     Combines E-Graph structural hashing with pointer-stride topology to collapse
-     inlined `std::map` red-black tree rotations, `std::vector` slow-path
-     reallocations, and Rust `core::result::Result` match branches into single-line
-     semantic expressions (`map[key] = val`).
-  5. Kill-Shot 5 — Concolic Execution (`concolic_explore`) & Trace-Merged
-     Decompilation (`ConcolicAndTraceMergeEngine`):
-     Solves branch path constraints from concrete emulator memory snapshots and
-     feeds dynamic execution traces (resolved `BLR` targets, concrete constants)
-     back into P-Code constant propagation to prune dead opaque-predicate branches.
+  1. `PatchestryMLIRPipeline` & `RellicGotoFreeRestructurer`:
+     Emits synthetic MLIR dialect text (`patchestry.ssa`) from basic block specs
+     and projects path conditions to structure acyclic CFGs without `goto`.
+  2. `DLiFTGRPOEngine`:
+     Computes group-normalized advantages ($\hat{A}_i = \frac{D_i - \mu_D}{\sigma_D + \epsilon}$)
+     over candidate completions scored by $R_{\text{syn}}$, $R_{\text{sem}}$,
+     and $R_{\text{read}}$.
+  3. `CSRSparseMatrixVSAEngine`:
+     Stores graph edges in Compressed Sparse Row (CSR) arrays and looks up
+     indirect `BLR` call targets by `(vtable_base, slot_offset)`.
+  4. `MonomorphizedTemplateCollapser`:
+     Matches pointer-stride sets and loop counts from `InlinedTemplateSubgraph`
+     against `std::map` and `std::vector` patterns to emit a single C statement.
+  5. `ConcolicAndTraceMergeEngine`:
+     Evaluates simple branch comparisons (`==`, `!=`, `>`, `<`) against a seed
+     dict and substitutes resolved indirect call strings into decompiled C text.
 """
 
 from __future__ import annotations
@@ -47,13 +38,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 
-# =============================================================================
-# KILL-SHOT 1: MLIR (PATCHESTRY / RELLIC) TIERED LOWERING & GOTO-FREE AST
-# =============================================================================
-
 @dataclass
 class CFGNodeSpec:
-    """Basic block specification for Rellic-style region-based restructuring."""
+    """Basic block specification for condition-projected region restructuring."""
     block_id: int
     statements: List[str]
     branch_cond: Optional[str] = None
@@ -63,10 +50,9 @@ class CFGNodeSpec:
 
 class RellicGotoFreeRestructurer:
     """
-    Implements Section 7.1 'Lift P-Code to MLIR (Patchestry / Rellic Dialect Stack)':
-    Lowers P-Code operations through 3 tiered MLIR dialect representations
-    (`patchestry.low` -> `patchestry.ssa` -> `hl.c_ast`) and applies `Rellic`'s
-    condition-projected region restructuring to eliminate 100% of `goto` statements.
+    Formats basic blocks into `patchestry.ssa` dialect text and projects path
+    reaching conditions in topological order to emit `goto`-free C code for
+    acyclic control flow graphs.
     """
 
     @classmethod
@@ -169,17 +155,13 @@ class RellicGotoFreeRestructurer:
 
 
 class PatchestryMLIRPipeline(RellicGotoFreeRestructurer):
-    """Tiered MLIR lowering pipeline (patchestry.low -> patchestry.ssa -> hl.c_ast)."""
+    """Subclass alias for `RellicGotoFreeRestructurer`."""
     pass
 
 
-# =============================================================================
-# KILL-SHOT 2: D-LiFT GRPO POLICY OPTIMIZATION & SELF-VERIFYING NEURAL ENGINE
-# =============================================================================
-
 @dataclass
 class DLiFTCandidateCompletion:
-    """Single LLM rollout candidate evaluated by the D-LiFT 3-stage reward gate."""
+    """Single candidate completion evaluated by syntax, semantic, and readability scores."""
     candidate_id: str
     c_code: str
     r_syn: float
@@ -193,13 +175,10 @@ class DLiFTCandidateCompletion:
 
 class DLiFTGRPOEngine:
     """
-    Implements Section 7.2 'D-Score Gated Inference & GRPO Fine-Tuning':
-    Computes Group Relative Policy Optimization (GRPO) advantages across a group
-    of $G$ sampled neural decompiler rollouts:
+    Computes group-normalized advantages across candidate completions:
       D_i = R_syn(y_i) * R_sem(y_i) * R_read(y_i)
       A_hat_i = (D_i - mean(D)) / (std(D) + 1e-8)
-    and selects only the highest-scoring candidate that passes 100% syntax and
-    Z3/bit-exact semantic equivalence (`R_syn == 1.0` and `R_sem == 1.0`).
+    and selects the highest-scoring candidate with `r_syn == 1.0` and `r_sem == 1.0`.
     """
 
     @staticmethod
@@ -227,16 +206,11 @@ class DLiFTGRPOEngine:
         }
 
 
-# =============================================================================
-# KILL-SHOT 3: CSR SPARSE-MATRIX WHOLE-BINARY VSA & INDIRECT CALL RESOLVER
-# =============================================================================
-
 class CSRSparseMatrixVSAEngine:
     """
-    Implements Section 7.3 'Instant Inter-Procedural Taint & Value-Set Analysis (VSA)':
-    Packs whole-binary P-Code def-use edges into Compressed Sparse Row (CSR) arrays
-    (`indptr`, `indices`, `data`) and resolves indirect `BLR x8` vtable call sites
-    against vtable slot ranges.
+    Packs directed graph edges into Compressed Sparse Row (CSR) arrays
+    (`indptr`, `indices`, `data`) and resolves indirect `BLR` call targets
+    from registered `(vtable_base, slot_offset)` pairs.
     """
 
     def __init__(self, num_nodes: int) -> None:
@@ -273,13 +247,9 @@ class CSRSparseMatrixVSAEngine:
         return targets
 
 
-# =============================================================================
-# KILL-SHOT 4: ZERO-HEURISTIC C++ STL & RUST MONOMORPHIZED TEMPLATE COLLAPSER
-# =============================================================================
-
 @dataclass
 class InlinedTemplateSubgraph:
-    """Topological summary of an inlined C++ STL or Rust monomorphized template block."""
+    """Summary of pointer strides and loop counts for an inlined C++ or Rust template block."""
     rva: int
     pointer_strides: List[int]          # e.g. [0, 8, 16, 24] for std::_Rb_tree_node (color, parent, left, right)
     loop_back_edges: int
@@ -292,11 +262,9 @@ class InlinedTemplateSubgraph:
 
 class MonomorphizedTemplateCollapser:
     """
-    Implements Section 7.4 'Zero-Heuristic C++ STL / Rust Monomorphization':
-    Recognizes heavily inlined C++ STL (`std::map` red-black tree rebalancing,
-    `std::vector` 2x geometric growth) and Rust (`core::result::Result` discriminant
-    branching) by their pointer-stride and loop topology, collapsing hundreds of
-    lines of pointer rotations into a single semantic statement.
+    Matches `InlinedTemplateSubgraph` stride sets and loop/swap counts against
+    `std::map` red-black tree insert and `std::vector::push_back` patterns,
+    returning a single C statement for matched regions.
     """
 
     @staticmethod
@@ -332,13 +300,9 @@ class MonomorphizedTemplateCollapser:
         }
 
 
-# =============================================================================
-# KILL-SHOT 5: CONCOLIC EXECUTION (`concolic_explore`) & TRACE-MERGED DECOMPILATION
-# =============================================================================
-
 @dataclass
 class BranchConstraint:
-    """Symbolic path condition along a path from entry RVA to a target branch RVA."""
+    """Single field comparison constraint along a path to a target branch RVA."""
     branch_rva: int
     field_name: str
     operator: str               # '==', '!=', '>', '<', '&'
@@ -347,13 +311,9 @@ class BranchConstraint:
 
 class ConcolicAndTraceMergeEngine:
     """
-    Implements Section 7.5 'Turn Dynamic Sidecars into Concolic Execution & Time-Travel Slicing':
-      1. `concolic_explore(rva, target_branch_rva)`: Solves path constraints over a
-         concrete emulator memory snapshot to synthesize the exact struct field values
-         required to reach `target_branch_rva`.
-      2. `merge_dynamic_trace_into_c`: Injects resolved runtime indirect jump targets
-         and constant register values into the decompiler output, pruning dead
-         opaque-predicate branches.
+    Updates a concrete seed dict to satisfy simple `BranchConstraint` comparisons
+    (`concolic_explore`) and replaces indirect call strings / dead guard lines
+    in decompiled C (`merge_dynamic_trace_into_c`).
     """
 
     @staticmethod
@@ -403,14 +363,11 @@ class ConcolicAndTraceMergeEngine:
         return "\n".join(kept_lines)
 
 
-# =============================================================================
-# SELF-VERIFICATION SUITE FOR SECTIONS 6 & 7 (PHASE 1 & PHASE 2 KILL-SHOTS)
-# =============================================================================
-
 def run_section6_7_verification() -> Dict[str, Any]:
+    """Run self-checks for all five prototype components in this module."""
     summary: Dict[str, Any] = {}
 
-    # 1. Verify Kill-Shot 1: MLIR Patchestry Lowering & Rellic Goto-Free Restructuring
+    # 1. Verify MLIR lowering and region restructuring
     cfg_nodes = [
         CFGNodeSpec(0, ["int status = validate_header(pkt);"], "status == 0", 1, 2),
         CFGNodeSpec(1, ["dispatch_order(pkt);"], None, 3, None),
@@ -426,7 +383,7 @@ def run_section6_7_verification() -> Dict[str, Any]:
         "structured_c_preview": rellic_res["structured_c_code"],
     }
 
-    # 2. Verify Kill-Shot 2: D-LiFT GRPO Advantage Calculation & Gated Selection
+    # 2. Verify D-LiFT GRPO advantage calculation and gated selection
     rollouts = [
         DLiFTCandidateCompletion("cand_hallucinated_hex", "if (err == 16) return 0;", 0.5, 0.0, 0.95),
         DLiFTCandidateCompletion("cand_verbose_casts", "if (err == 0x16) return *(int*)a;", 1.0, 1.0, 0.70),
@@ -437,7 +394,7 @@ def run_section6_7_verification() -> Dict[str, Any]:
     assert grpo_res["grpo_advantages"]["cand_clean_struct"] > 0.8
     summary["killshot2_dlift_grpo"] = grpo_res
 
-    # 3. Verify Kill-Shot 3: CSR Sparse-Matrix VSA & Indirect BLR x8 Resolution
+    # 3. Verify CSR sparse-matrix VSA and indirect BLR resolution
     vsa = CSRSparseMatrixVSAEngine(num_nodes=5)
     vsa.add_edge(0, 1)
     vsa.add_edge(1, 3)
@@ -452,7 +409,7 @@ def run_section6_7_verification() -> Dict[str, Any]:
         "resolved_blr_x8_targets": resolved_targets,
     }
 
-    # 4. Verify Kill-Shot 4: Zero-Heuristic C++ STL Inlined Red-Black Tree Collapser
+    # 4. Verify C++ STL inlined red-black tree pattern collapser
     rbtree_sub = InlinedTemplateSubgraph(
         rva=0x00712000,
         pointer_strides=[0, 8, 16, 24],
@@ -467,7 +424,7 @@ def run_section6_7_verification() -> Dict[str, Any]:
     assert collapsed["collapsed_c_statement"] == "this->order_rewards[order_id] = reward_xp;"
     summary["killshot4_stl_monomorphization"] = collapsed
 
-    # 5. Verify Kill-Shot 5: Concolic Exploration & Trace-Merged Decompilation
+    # 5. Verify concolic constraint evaluation and trace-merged C substitution
     concolic_res = ConcolicAndTraceMergeEngine.concolic_explore(
         entry_rva=0x00412000,
         target_branch_rva=0x00412190,
@@ -503,7 +460,7 @@ def run_section6_7_verification() -> Dict[str, Any]:
 
 
 def run_phase1_phase2_demonstration() -> Dict[str, Any]:
-    """Execute end-to-end demonstration verification of Phase 1 roadmap & Phase 2 kill-shots."""
+    """Alias for `run_section6_7_verification`."""
     return run_section6_7_verification()
 
 

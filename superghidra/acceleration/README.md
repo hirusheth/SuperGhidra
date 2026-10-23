@@ -9,11 +9,14 @@
 | [`gpu_adrp_scanner.py`](gpu_adrp_scanner.py) | `GPUAdrpScanner`, `ADRPMatch`, `NumPyAdrpEngine`, `decode_adrp_target`, `decode_add_imm`, `decode_ldr_imm`, `benchmark_scanner` | Sweeps ARM64 `.text` sections for `ADRP` + `ADD`/`LDR` pairs across `+4`, `+8`, `+12` byte windows via WGPU compute shaders, PyTorch CUDA, or vectorized NumPy SIMD fallback. |
 | [`gpu_function_seeder.py`](gpu_function_seeder.py) | `GPUFunctionSeeder`, `FunctionSeed` | Parallel 32-bit instruction classifier discovering ARM64 function entry points (`PACIASP`, `STP x29, x30, [sp, #-imm]!`, `SUB sp, sp, #imm`, `BTI`, `BL` targets, and `.rodata`/`.data.rel.ro` code pointers). |
 
-## 2. Key Data Structures & Invariants
+## 2. Key Data Structures, Crossover Threshold & Invariants
 - **`ADRPMatch` Resolution:**
   - `target_page = (adrp_pc & ~0xFFF) + sign_extend_21(immhi:immlo) * 4096`.
   - `decode_ldr_imm` strictly rejects `STR` instructions (`opc == 0` when `v == 0`, or `opc & 1 == 0` for SIMD/FP `Q` loads) and scales 128-bit `LDR Q` unsigned offsets by `16` (`size == 0 and v == 1 and (opc & 2) != 0`).
   - Backend equivalence invariant: `wgpu`, `cuda`, and `numpy`/`cpu` backends must return identical sorted `ADRPMatch` results without silently truncating hits when candidate buffers fill.
+- **CPU SIMD vs. WGPU Crossover Threshold (~5–10 MB):**
+  - On a 4 MB `.text` section (1,048,576 instructions on one Windows dev machine), vectorized CPU NumPy SIMD reaches `143.95M insn/s` (`7.28 ms`) whereas WGPU reaches `127.25M insn/s` (`8.24 ms`) because PCIe host-to-device buffer staging and readback overhead dominate small transfers.
+  - Below ~5–10 MB of `.text`, prefer the `numpy` CPU SIMD path; WGPU/CUDA compute dispatch only amortizes PCIe transfer overhead on larger binaries or batched multi-section sweeps.
 - **`FunctionSeed` Multi-Source Scoring:** Combines prologue flags, incoming `BL` call targets, `RET` boundary precursors, and data section function pointers into calibrated confidence scores.
 
 ## 3. Quick-Test Command

@@ -2,12 +2,14 @@
 Compilable Decompiler Filter and C Idiom Normalizer.
 References: U1, U2, U3 in docs/SUPERGHIDRA_ARCHITECTURE_AND_IDA_PRO_GAP_ANALYSIS.md
 
-Transforms Ghidra's raw decompiler pseudo-C AST into compilable, standard C99/C++17 code:
+Transforms Ghidra's raw decompiler pseudo-C AST and Hex-Rays IDA Pro pseudo-C
+into compilable, standard C99/C++17 code:
 1. Rewrites Ghidra synthetic scalar types (undefined*, ulonglong, etc.) into <stdint.h> types.
 2. Expands Ghidra synthetic macro intrinsics (CONCAT44, SUB84, ZEXT48, SEXT48) into standard C bitwise expressions.
 3. Cleans compiler idioms (stack canaries, in_FS_OFFSET, extraout_*, __stack_chk_fail).
 4. Cleans calling convention warning comments and demangles signatures.
-5. Injects standard headers (#include <stdint.h>, <stdbool.h>, <stddef.h>).
+5. Provides a clean-room Hex-Rays defs.h compatibility header (IDA_COMPAT_DEFS_H) and normalizes IDA idioms.
+6. Injects standard headers (#include <stdint.h>, <stdbool.h>, <stddef.h>).
 """
 
 from __future__ import annotations
@@ -50,10 +52,166 @@ STANDARD_HEADERS = (
     "#include <stddef.h>\n"
 )
 
+# Clean-room C99/C++17 compatibility header for Hex-Rays IDA Pro pseudo-C emissions.
+IDA_COMPAT_DEFS_H = """#ifndef SUPERGHIDRA_IDA_COMPAT_DEFS_H
+#define SUPERGHIDRA_IDA_COMPAT_DEFS_H
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+typedef uint8_t _BYTE;
+typedef uint16_t _WORD;
+typedef uint32_t _DWORD;
+typedef uint64_t _QWORD;
+#if defined(__SIZEOF_INT128__)
+typedef __uint128_t _OWORD;
+#else
+typedef struct { uint64_t lo; uint64_t hi; } _OWORD;
+#endif
+typedef int8_t _BOOL1;
+typedef int16_t _BOOL2;
+typedef int32_t _BOOL4;
+typedef int64_t _BOOL8;
+typedef uint8_t _UNKNOWN;
+
+#if !defined(_MSC_VER) && !defined(__MINGW32__)
+#ifndef __int8
+typedef int8_t __int8;
+#endif
+#ifndef __int16
+typedef int16_t __int16;
+#endif
+#ifndef __int32
+typedef int32_t __int32;
+#endif
+#ifndef __int64
+typedef int64_t __int64;
+#endif
+#endif
+
+#ifndef LOBYTE
+#define LOBYTE(x) ((_BYTE)((uint64_t)(x) & 0xFFU))
+#endif
+#ifndef HIBYTE
+#define HIBYTE(x) ((_BYTE)(((uint64_t)(x) >> 8) & 0xFFU))
+#endif
+#ifndef LOWORD
+#define LOWORD(x) ((_WORD)((uint64_t)(x) & 0xFFFFU))
+#endif
+#ifndef HIWORD
+#define HIWORD(x) ((_WORD)(((uint64_t)(x) >> 16) & 0xFFFFU))
+#endif
+#ifndef LODWORD
+#define LODWORD(x) ((_DWORD)((uint64_t)(x) & 0xFFFFFFFFULL))
+#endif
+#ifndef HIDWORD
+#define HIDWORD(x) ((_DWORD)(((uint64_t)(x) >> 32) & 0xFFFFFFFFULL))
+#endif
+
+#define BYTE1(x) ((_BYTE)(((uint64_t)(x) >> 8) & 0xFFU))
+#define BYTE2(x) ((_BYTE)(((uint64_t)(x) >> 16) & 0xFFU))
+#define BYTE3(x) ((_BYTE)(((uint64_t)(x) >> 24) & 0xFFU))
+#define BYTE4(x) ((_BYTE)(((uint64_t)(x) >> 32) & 0xFFU))
+#define BYTE5(x) ((_BYTE)(((uint64_t)(x) >> 40) & 0xFFU))
+#define BYTE6(x) ((_BYTE)(((uint64_t)(x) >> 48) & 0xFFU))
+#define BYTE7(x) ((_BYTE)(((uint64_t)(x) >> 56) & 0xFFU))
+
+#define WORD1(x) ((_WORD)(((uint64_t)(x) >> 16) & 0xFFFFU))
+#define WORD2(x) ((_WORD)(((uint64_t)(x) >> 32) & 0xFFFFU))
+#define WORD3(x) ((_WORD)(((uint64_t)(x) >> 48) & 0xFFFFU))
+
+#define DWORD1(x) ((_DWORD)(((uint64_t)(x) >> 32) & 0xFFFFFFFFULL))
+#define DWORD2(x) (*((_DWORD *)&(x) + 2))
+
+#define SLOBYTE(x) ((int8_t)((uint64_t)(x) & 0xFFU))
+#define SHIBYTE(x) ((int8_t)(((uint64_t)(x) >> 8) & 0xFFU))
+#define SLOWORD(x) ((int16_t)((uint64_t)(x) & 0xFFFFU))
+#define SHIWORD(x) ((int16_t)(((uint64_t)(x) >> 16) & 0xFFFFU))
+#define SLODWORD(x) ((int32_t)((uint64_t)(x) & 0xFFFFFFFFULL))
+#define SHIDWORD(x) ((int32_t)(((uint64_t)(x) >> 32) & 0xFFFFFFFFULL))
+
+#define __PAIR16__(high, low) ((((uint16_t)(high)) << 8) | (uint8_t)(low))
+#define __PAIR32__(high, low) ((((uint32_t)(high)) << 16) | (uint16_t)(low))
+#define __PAIR64__(high, low) ((((uint64_t)(high)) << 32) | (uint32_t)(low))
+
+static inline float _sg_coerce_float(uint32_t v) {
+    union { uint32_t u; float f; } u;
+    u.u = v;
+    return u.f;
+}
+static inline double _sg_coerce_double(uint64_t v) {
+    union { uint64_t u; double d; } u;
+    u.u = v;
+    return u.d;
+}
+static inline uint32_t _sg_coerce_uint32(float f) {
+    union { float f; uint32_t u; } u;
+    u.f = f;
+    return u.u;
+}
+static inline uint64_t _sg_coerce_uint64(double d) {
+    union { double d; uint64_t u; } u;
+    u.d = d;
+    return u.u;
+}
+
+#define COERCE_FLOAT(v) _sg_coerce_float((uint32_t)(v))
+#define COERCE_DOUBLE(v) _sg_coerce_double((uint64_t)(v))
+#define COERCE_UNSIGNED_INT(v) _sg_coerce_uint32((float)(v))
+#define COERCE_UNSIGNED_INT64(v) _sg_coerce_uint64((double)(v))
+
+static inline int _sg_parity8(uint8_t v) {
+    v ^= v >> 4;
+    v ^= v >> 2;
+    v ^= v >> 1;
+    return (~v) & 1;
+}
+
+#define __CFADD__(x, y) (sizeof(x) <= 4 ? ((uint32_t)(x) > (uint32_t)((uint32_t)(x) + (uint32_t)(y))) : ((uint64_t)(x) > (uint64_t)((uint64_t)(x) + (uint64_t)(y))))
+#define __OFSUB__(x, y) (sizeof(x) <= 4 ? ((((int32_t)(x) ^ (int32_t)(y)) < 0) && (((int32_t)(x) ^ (int32_t)((uint32_t)(x) - (uint32_t)(y))) < 0)) : ((((int64_t)(x) ^ (int64_t)(y)) < 0) && (((int64_t)(x) ^ (int64_t)((uint64_t)(x) - (uint64_t)(y))) < 0)))
+#define __SETP__(x, y) _sg_parity8((uint8_t)((uint64_t)(x) - (uint64_t)(y)))
+#endif /* SUPERGHIDRA_IDA_COMPAT_DEFS_H */
+"""
+
+_IDA_LVALUE_MACRO_MAP = {
+    "LOBYTE": ("_BYTE", 0),
+    "HIBYTE": ("_BYTE", 1),
+    "BYTE1": ("_BYTE", 1),
+    "BYTE2": ("_BYTE", 2),
+    "BYTE3": ("_BYTE", 3),
+    "BYTE4": ("_BYTE", 4),
+    "BYTE5": ("_BYTE", 5),
+    "BYTE6": ("_BYTE", 6),
+    "BYTE7": ("_BYTE", 7),
+    "LOWORD": ("_WORD", 0),
+    "HIWORD": ("_WORD", 1),
+    "WORD1": ("_WORD", 1),
+    "WORD2": ("_WORD", 2),
+    "WORD3": ("_WORD", 3),
+    "LODWORD": ("_DWORD", 0),
+    "HIDWORD": ("_DWORD", 1),
+    "DWORD1": ("_DWORD", 1),
+    "DWORD2": ("_DWORD", 2),
+    "SLOBYTE": ("int8_t", 0),
+    "SHIBYTE": ("int8_t", 1),
+    "SLOWORD": ("int16_t", 0),
+    "SHIWORD": ("int16_t", 1),
+    "SLODWORD": ("int32_t", 0),
+    "SHIDWORD": ("int32_t", 1),
+}
+
+_IDA_TOKEN_RE = re.compile(
+    r"\b(?:_BYTE|_WORD|_DWORD|_QWORD|_OWORD|_BOOL[1248]|__int(?:8|16|32|64)|_UNKNOWN|"
+    r"LOBYTE|HIBYTE|LOWORD|HIWORD|LODWORD|HIDWORD|BYTE[1-7]|WORD[1-3]|DWORD[12]|"
+    r"SLOBYTE|SHIBYTE|SLOWORD|SHIWORD|SLODWORD|SHIDWORD|__PAIR(?:16|32|64)__|"
+    r"COERCE_FLOAT|COERCE_DOUBLE|COERCE_UNSIGNED_INT|COERCE_UNSIGNED_INT64|"
+    r"__CFADD__|__OFSUB__|__SETP__)\b"
+)
+
 
 class CompilableDecompilerFilter:
     """
-    Normalizes Ghidra pseudo-C into standard compilable C source code.
+    Normalizes Ghidra and IDA Pro pseudo-C into standard compilable C source code.
     """
 
     @classmethod
@@ -63,6 +221,48 @@ class CompilableDecompilerFilter:
         for pattern, replacement in GHIDRA_TYPE_MAP:
             result = re.sub(pattern, replacement, result)
         return result
+
+    @classmethod
+    def normalize_ida_idioms(cls, code: str) -> str:
+        """
+        Strips Hex-Rays IDA Pro calling convention/register annotations and
+        rewrites lvalue byte/word/dword extraction assignments into pointer casts.
+        """
+        # 1. Strip IDA separator banners: //----- (0000000000401120) ----
+        code = re.sub(
+            r"^\s*//-{3,}\s*\([0-9A-Fa-f]+\)\s*-+.*?\n?",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+
+        # 2. Strip __spoils<...> annotations
+        code = re.sub(r"\b__spoils\s*<[^>]*>\s*", "", code)
+
+        # 3. Strip @<register> location annotations (used with __usercall / __userpurge)
+        code = re.sub(r"@\s*<[a-zA-Z0-9_:]+>", "", code)
+
+        # 4. Strip IDA calling convention specifiers
+        code = re.sub(
+            r"\b(?:__fastcall|__usercall|__userpurge|__cdecl|__stdcall|__thiscall|__vectorcall|__noreturn)\b\s*",
+            "",
+            code,
+        )
+
+        # 5. Rewrite lvalue macro assignments: MACRO(lhs) = -> (*((type *)&(lhs) + idx)) =
+        def _repl_lvalue_macro(m: re.Match) -> str:
+            macro = m.group(1)
+            arg = m.group(2).strip()
+            ctype, idx = _IDA_LVALUE_MACRO_MAP[macro]
+            return f"(*(({ctype} *)&({arg}) + {idx})) "
+
+        macro_names = "|".join(_IDA_LVALUE_MACRO_MAP.keys())
+        code = re.sub(
+            rf"\b({macro_names})\s*\(([^()]+)\)\s*(?==[^=])",
+            _repl_lvalue_macro,
+            code,
+        )
+        return code
 
     @classmethod
     def expand_intrinsics(cls, code: str) -> str:
@@ -373,6 +573,7 @@ class CompilableDecompilerFilter:
         include_headers: bool = True,
         collapse_strides: bool = True,
         struct_catalog: Optional[dict] = None,
+        include_ida_defs: bool = True,
     ) -> str:
         """
         Applies full pipeline of compilable transformations.
@@ -380,7 +581,9 @@ class CompilableDecompilerFilter:
         if not code or not emit_compilable:
             return code
 
-        result = cls.rewrite_types(code)
+        has_ida_tokens = bool(_IDA_TOKEN_RE.search(code))
+        result = cls.normalize_ida_idioms(code)
+        result = cls.rewrite_types(result)
         result = cls.expand_intrinsics(result)
 
         if strip_canary:
@@ -392,8 +595,13 @@ class CompilableDecompilerFilter:
         result = cls.resolve_callee_types(result, struct_catalog=struct_catalog)
         result = cls.glibc_ctype_support(result)
 
+        if include_ida_defs and (has_ida_tokens or bool(_IDA_TOKEN_RE.search(result))):
+            if "SUPERGHIDRA_IDA_COMPAT_DEFS_H" not in result:
+                result = f"{IDA_COMPAT_DEFS_H}\n{result.lstrip()}"
+
         if include_headers and "#include <stdint.h>" not in result:
+            result = f"{STANDARD_HEADERS}\n{result.lstrip()}"
+        elif include_headers and not result.startswith("#include <stdint.h>"):
             result = f"{STANDARD_HEADERS}\n{result.lstrip()}"
 
         return result
-

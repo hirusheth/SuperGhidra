@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "superghidra"
 version = "0.3.0"
-description = "SuperGhidra: High-Performance Ghidra Architecture & GPU Acceleration Suite"
+description = "SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [

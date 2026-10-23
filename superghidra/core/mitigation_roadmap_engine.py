@@ -1,41 +1,27 @@
 #!/usr/bin/env python3
 """
-SuperGhidra Section 5 Current Mitigation Roadmap Engine (Countermeasures M1–M7)
-===============================================================================
+STATUS: Experimental research prototype.
 
-Reference Implementation for Section 5 ("Current Mitigation Roadmap: Engineering
-Around the Gaps") of `superghidra_architecture_and_ida_pro_gap_analysis.md`:
+Core production modules live in `ghidra_oracle.py`, `compilable_filter.py`,
+`binary_diff_engine.py`, and `struct_shift_migrator.py`. By contrast,
+`mitigation_roadmap_engine.py`, `phase1_phase2_roadmap_engine.py`, and
+`benchmark_and_nextgen_engine.py` are experimental research and simulation
+prototypes used to test Section 5 gap-mitigation ideas in isolation:
 
-  - Countermeasure M1 (Gap 1 — Microcode Hooks):
-    `GNNPCodeTensorEncoder` (`superghidra/lifters/`) — Lifts raw basic blocks to
-    standalone P-Code and encodes CFGs into normalized Graph Neural Network (GNN)
-    adjacency tensors ($\tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2}$) and 16-dim node
-    feature matrices.
-  - Countermeasure M2 (Gap 2 — CFF De-obfuscation):
-    `LeafXRefInversionEngine` & `NeuralDecompilerSkinningPipeline`
-    (`neural_decompiler_pipeline.py`) — Traces cross-references from unprotected
-    leaf logic (`ProductionQueue::addItem`, `.rela.dyn` entries) backwards into
-    control-flow-flattened callers and applies 2-phase Skeleton-to-Skin recovery.
-  - Countermeasure M3 (Gap 3 — `__usercall` Binding):
-    `ABIShimAndStructShiftAdapter` — Synthesizes register-remapping P-Code shims
-    and applies automated struct field displacement shifts across binary versions.
-  - Countermeasure M4 (Gap 4 — Appcall Invocation):
-    `EmulatorMemorySidecar` (`emulator_memory_sidecar.py`) — Couples static RVA
-    discovery to a framing protocol (`\0sys_render_ipc`) and page-granular memory
-    snapshot diffing sidecar to verify state mutations.
-  - Countermeasure M5 (Gap 5 — FLIRT / Lumina Signatures):
-    `OffHeapDWARF5SQLiteIndexer` (`superghidra/formats/`) — Indexes DWARF 5 / PDB
-    debug records into an off-heap SQLite store with SHA-256 structural type
-    deduplication across stripped sibling binaries.
-  - Countermeasure M6 (Gap 6 — Robust C Header Parser):
-    `MSVCAndMFCRecoveryEngine` (`msvc_class_recovery.py`) — Reconstructs 64-bit
-    MSVC RTTI (`_R4` CompleteObjectLocator, `_R0` TypeDescriptor, `_R3`
-    ClassHierarchyDescriptor, `_R1` BaseClassDescriptor) and MFC `CRuntimeClass` /
-    `CArchive` serialization layouts directly from PE image bytes without Ghidra GUI.
-  - Countermeasure M7 (Gap 7 — Native Memory & Speed):
-    `ResourceGovernorAndCacheDAG` (`superghidra/core/`) — Implements the 4-tier
-    CPU/RAM resource governor (`eco`, `balanced`, `turbo`, `auto`), SQLite L2
-    decompilation cache, and 1-hop callee-to-caller Cache Invalidation DAG.
+  - M1 (`GNNPCodeTensorEncoder`): Encodes lifted basic blocks into degree-normalized
+    adjacency matrices and 16-dimensional node feature vectors.
+  - M2 (`LeafXRefInversionEngine`): Traces cross-references from leaf functions
+    upward into control-flow-flattened callers and renames arguments from call sites.
+  - M3 (`ABIShimAndStructShiftAdapter`): Emits P-Code shims for vector-register
+    integer spills and rewrites shifted pointer displacements in decompiled C.
+  - M4 (`EmulatorMemorySidecar`): Packs IPC command frames (`\\0sys_render_ipc`)
+    and diffs 4 KB memory page snapshots before and after execution.
+  - M5 (`OffHeapDWARF5SQLiteIndexer`): Stores DWARF 5 / PDB struct definitions in
+    SQLite and deduplicates layouts across compile units by SHA-256 hash.
+  - M6 (`MSVCAndMFCRecoveryEngine`): Parses 64-bit MSVC RTTI descriptors and MFC
+    `CRuntimeClass` records from raw PE `.rdata` bytes.
+  - M7 (`ResourceGovernorAndCacheDAG`): Computes thread/memory budgets (`eco`,
+    `balanced`, `turbo`, `auto`) and invalidates 1-hop callers on signature edits.
 """
 
 from __future__ import annotations
@@ -54,13 +40,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 
-# =============================================================================
-# COUNTERMEASURE M1: ZERO-JVM P-CODE LIFTER + GNN ADJACENCY TENSOR ENCODER
-# =============================================================================
-
 @dataclass
 class LiftedBasicBlock:
-    """Basic block representation produced by the standalone Zero-JVM P-Code lifter."""
+    """Basic block summary with P-Code opcode names, immediates, and outgoing edges."""
     block_id: int
     start_rva: int
     end_rva: int
@@ -71,12 +53,10 @@ class LiftedBasicBlock:
 
 class GNNPCodeTensorEncoder:
     """
-    Implements Countermeasure M1 (`superghidra/lifters/`):
-    Encodes a lifted P-Code Control Flow Graph into:
-      1. Symmetric degree-normalized adjacency tensor:
-         A_hat = D_tilde^(-1/2) @ (A + I) @ D_tilde^(-1/2)
-      2. 16-dimensional node feature matrix X in R^(N x 16) capturing opcode
-         class distribution, immediate entropy, in/out degree, and block span.
+    Encodes a sequence of lifted P-Code basic blocks into a symmetric
+    degree-normalized adjacency matrix `D_tilde^(-1/2) @ (A + I) @ D_tilde^(-1/2)`
+    and an `(N, 16)` node feature matrix covering opcode frequencies, degrees,
+    immediate count, and byte span.
     """
 
     OPCODE_BUCKETS: Dict[str, int] = {
@@ -151,13 +131,9 @@ class GNNPCodeTensorEncoder:
         }
 
 
-# =============================================================================
-# COUNTERMEASURE M2: LEAF XREF INVERSION + 2-PHASE NEURAL DECOMPILER SKINNING
-# =============================================================================
-
 @dataclass
 class RelocationOrLeafXRef:
-    """Represents an unprotected leaf function or `.rela.dyn` symbol reference."""
+    """Leaf function or `.rela.dyn` symbol reference with observed call-site register arguments."""
     symbol_name: str
     leaf_rva: int
     caller_rva: int
@@ -167,12 +143,9 @@ class RelocationOrLeafXRef:
 
 class LeafXRefInversionEngine:
     """
-    Implements Countermeasure M2 (`neural_decompiler_pipeline.py`):
-    When a caller function is heavily obfuscated by Control Flow Flattening (CFF),
-    SuperGhidra traces cross-references *upward* from unprotected leaf functions
-    (e.g., `ProductionQueue::addItem`) and `.rela.dyn` entries, slices the relevant
-    dataflow reaching each leaf call site, and performs 2-phase Skeleton-to-Skin
-    semantic variable and structure recovery.
+    Traces cross-references upward from un-obfuscated leaf functions and `.rela.dyn`
+    symbols into control-flow-flattened callers, renaming local variables from
+    call-site register arguments and stripping state-machine switch boilerplate.
     """
 
     def __init__(self) -> None:
@@ -226,16 +199,11 @@ class LeafXRefInversionEngine:
         }
 
 
-# =============================================================================
-# COUNTERMEASURE M3: AUTOMATED STRUCT SHIFT MIGRATOR & TYPE SHIMS
-# =============================================================================
-
 class ABIShimAndStructShiftAdapter:
     """
-    Implements Countermeasure M3:
-    Generates P-Code register-binding shims for non-standard compiler register
-    allocations (e.g., Clang `-O3` vector register `d0` integer spills) and rewrites
-    displaced struct field offsets across binary versions.
+    Emits P-Code register-binding shims for vector-register integer spills
+    (such as Clang `-O3` spills into `d0`) and rewrites shifted struct pointer
+    displacements in decompiled C.
     """
 
     @staticmethod
@@ -272,13 +240,9 @@ class ABIShimAndStructShiftAdapter:
         return pattern.sub(_replacer, c_code)
 
 
-# =============================================================================
-# COUNTERMEASURE M4: EMULATOR MEMORY SIDECAR & IPC STATE VERIFIER
-# =============================================================================
-
 @dataclass
 class IPCCommandEnvelope:
-    """Framing packet for abstract UNIX socket (`\\0sys_render_ipc`) verification."""
+    """Framing packet for abstract UNIX socket (`\\0sys_render_ipc`) messages."""
     magic: bytes = b"SGIP"
     command_id: int = 0
     target_rva: int = 0
@@ -298,9 +262,8 @@ class IPCCommandEnvelope:
 
 class EmulatorMemorySidecar:
     """
-    Implements Countermeasure M4 (`emulator_memory_sidecar.py`):
-    Couples static RVA discovery with an in-memory snapshot diffing engine that
-    identifies exact struct offsets mutated during a command execution window.
+    Stores 4 KB pre-execution memory page snapshots and diffs post-execution
+    pages at 32-bit or 64-bit word granularity to record mutated offsets.
     """
 
     PAGE_SIZE = 4096
@@ -340,10 +303,6 @@ class EmulatorMemorySidecar:
         return mutations
 
 
-# =============================================================================
-# COUNTERMEASURE M5: OFF-HEAP DWARF 5 / PDB SQLITE TYPE & SYMBOL DEDUPLICATOR
-# =============================================================================
-
 @dataclass
 class DWARFTypeDIE:
     """Decoded DWARF 5 `DW_TAG_structure_type` / `DW_TAG_class_type` DIE record."""
@@ -355,10 +314,8 @@ class DWARFTypeDIE:
 
 class OffHeapDWARF5SQLiteIndexer:
     """
-    Implements Countermeasure M5 (`superghidra/formats/`):
-    Stores DWARF 5 and PDB type hierarchies off-heap in SQLite (avoiding JVM heap
-    exhaustion on 60+ MB binaries) and deduplicates identical struct layouts across
-    thousand of compile units via canonical SHA-256 layout hashes.
+    Stores DWARF 5 and PDB struct definitions in SQLite and deduplicates
+    identical struct layouts across compile units by canonical SHA-256 hash.
     """
 
     def __init__(self, db_path: str = ":memory:") -> None:
@@ -454,10 +411,6 @@ class OffHeapDWARF5SQLiteIndexer:
             self.conn.close()
 
 
-# =============================================================================
-# COUNTERMEASURE M6: STANDALONE MSVC RTTI & MFC CRuntimeClass / CArchive RECOVERY
-# =============================================================================
-
 @dataclass
 class MSVCRecoveredClass:
     """Reconstructed MSVC C++ class hierarchy from PE `.rdata` RTTI descriptors."""
@@ -472,7 +425,7 @@ class MSVCRecoveredClass:
 
 @dataclass
 class MFCRuntimeClassRecord:
-    """Reconstructed MFC `CRuntimeClass` & `CArchive` schema metadata."""
+    """Reconstructed MFC `CRuntimeClass` and `CArchive` schema metadata."""
     class_name: str
     object_byte_size: int
     schema_version: int
@@ -482,10 +435,8 @@ class MFCRuntimeClassRecord:
 
 class MSVCAndMFCRecoveryEngine:
     """
-    Implements Countermeasure M6 (`msvc_class_recovery.py`):
-    Standalone binary parser that recovers 64-bit MSVC `_RTTICompleteObjectLocator`
-    (`signature == 1` for x64 image-relative offsets) and MFC `CRuntimeClass`
-    structures directly from raw image bytes without launching Ghidra GUI.
+    Parses 64-bit MSVC `_RTTICompleteObjectLocator` (`signature == 1`) and MFC
+    `CRuntimeClass` structures from raw PE section bytes.
     """
 
     # 64-bit MSVC _RTTICompleteObjectLocator:
@@ -584,23 +535,17 @@ class MSVCAndMFCRecoveryEngine:
         )
 
 
-# =============================================================================
-# COUNTERMEASURE M7: 4-TIER RESOURCE GOVERNOR & 1-HOP CACHE INVALIDATION DAG
-# =============================================================================
-
 class GovernorMode(enum.Enum):
     ECO = "eco"             # 25% CPU threads, 2 GB RAM cap, CPU SIMD only
     BALANCED = "balanced"   # 50% CPU threads, 6 GB RAM cap, shared GPU queue
-    TURBO = "turbo"         # 100% CPU threads, 16 GB RAM cap, dedicated CUDA/WebGPU streams
-    AUTO = "auto"           # Dynamic scaling based on system load & binary size
+    TURBO = "turbo"         # 100% CPU threads, 16 GB RAM cap, dedicated GPU streams
+    AUTO = "auto"           # Selects BALANCED or TURBO by binary size
 
 
 class ResourceGovernorAndCacheDAG:
     """
-    Implements Countermeasure M7 (`superghidra/core/`):
-    Combines the 4-tier CPU/RAM/GPU Resource Governor with a 1-hop Callee->Caller
-    Decompiler Cache DAG so updating a struct or signature on `callee` only
-    invalidates immediate 1-hop callers rather than re-analyzing the entire binary.
+    Selects worker thread and memory limits by `GovernorMode` and tracks
+    callee-to-caller edges so signature edits invalidate only 1-hop callers.
     """
 
     def __init__(self, mode: GovernorMode = GovernorMode.AUTO) -> None:
@@ -640,11 +585,8 @@ class ResourceGovernorAndCacheDAG:
         return invalidated
 
 
-# =============================================================================
-# SELF-VERIFICATION SUITE FOR SECTION 5 COUNTERMEASURES (M1–M7)
-# =============================================================================
-
 def run_section5_verification() -> Dict[str, Any]:
+    """Run self-checks for M1 through M7 and return a summary dictionary."""
     report: Dict[str, Any] = {}
 
     # Verify M1: GNN Adjacency & Feature Tensor Encoder

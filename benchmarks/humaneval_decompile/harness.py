@@ -8,10 +8,13 @@ prints averages recomputed from the per-sample score log. The historical
 from __future__ import annotations
 
 import json
+import random
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from superghidra.core.compilable_filter import IDA_COMPAT_DEFS_H
 
 BASELINE_PATH = Path(__file__).parent / "results_baseline.json"
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -97,6 +100,8 @@ LENIENT_TYPEDEFS = (
     "typedef uint32_t dword;\n"
     "typedef uint64_t qword;\n"
 )
+
+LENIENT_IDA_DEFS = IDA_COMPAT_DEFS_H
 
 
 class HumanEvalDecompileHarness:
@@ -300,10 +305,18 @@ def _align_function_name(pseudo: str, func_name: Any) -> str:
     return pseudo.replace(match.group(1), name)
 
 
-def _program(language: str, body_parts: List[str], *, typedefs: bool) -> str:
+def _program(
+    language: str,
+    body_parts: List[str],
+    *,
+    typedefs: bool,
+    ida_defs: bool = False,
+) -> str:
     chunks = [CPP_PRELUDE if language == "C++" else C_PRELUDE]
     if typedefs:
         chunks.append(LENIENT_TYPEDEFS)
+    if ida_defs:
+        chunks.append(LENIENT_IDA_DEFS)
     chunks.extend(part for part in body_parts if part)
     return "\n".join(chunks)
 
@@ -378,6 +391,215 @@ def score_sample(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def score_batch(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [score_sample(row) for row in rows]
+
+
+def _canonical_function_key(
+    row: Dict[str, Any],
+    *,
+    has_distinct_func: bool,
+    has_distinct_func_name: bool,
+) -> Tuple[str, str]:
+    """Derive a canonical function group key shared across O0-O3 variants."""
+    lang = _language(row.get("language"))
+    func_body = str(row.get("func") or "").strip()
+    func_name = str(row.get("func_name") or "").strip()
+    task_id = str(row.get("task_id") or "").strip()
+    idx = row.get("index")
+    if idx is None and ":" in task_id:
+        prefix = task_id.split(":", 1)[0]
+        if prefix.isdigit():
+            idx = int(prefix)
+        parts = task_id.split(":")
+        if len(parts) >= 2 and not func_name:
+            func_name = parts[1]
+
+    if has_distinct_func_name and func_name:
+        return (lang, func_name)
+    if has_distinct_func and func_body:
+        return (lang, func_body)
+    if idx is not None:
+        return (lang, f"func_group_{int(idx) // 4:04d}")
+    return (lang, func_name or func_body or task_id)
+
+
+def _group_corpus_by_function(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Tuple[str, str]], Dict[Tuple[str, str], List[Dict[str, Any]]]]:
+    funcs = {str(r.get("func") or "").strip() for r in rows if str(r.get("func") or "").strip()}
+    func_names = set()
+    for r in rows:
+        fn = str(r.get("func_name") or "").strip()
+        if not fn and ":" in str(r.get("task_id") or ""):
+            fn = str(r["task_id"]).split(":")[1]
+        if fn:
+            func_names.add(fn)
+    has_distinct_func = len(funcs) > 1
+    has_distinct_func_name = len(func_names) > 1
+
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    group_min_idx: Dict[Tuple[str, str], int] = {}
+    for pos, row in enumerate(rows):
+        key = _canonical_function_key(
+            row,
+            has_distinct_func=has_distinct_func,
+            has_distinct_func_name=has_distinct_func_name,
+        )
+        groups.setdefault(key, []).append(row)
+        idx = row.get("index")
+        if idx is None and ":" in str(row.get("task_id") or ""):
+            prefix = str(row["task_id"]).split(":", 1)[0]
+            if prefix.isdigit():
+                idx = int(prefix)
+        if idx is not None:
+            group_min_idx[key] = min(group_min_idx.get(key, int(idx)), int(idx))
+        else:
+            group_min_idx.setdefault(key, pos)
+
+    ordered_keys = sorted(groups.keys(), key=lambda k: (group_min_idx[k], k))
+    return ordered_keys, groups
+
+
+def split_humaneval_corpus(
+    rows: List[Dict[str, Any]],
+    train_ratio: float = 0.70,
+    seed: int = 42,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Deterministic function-grouped train/test split with zero function leakage.
+
+    Groups all optimization variants (O0-O3) of each unique function before
+    splitting so that every function's variants reside strictly in either
+    ``train`` (default 70%) or ``test`` (default 30%). Also returns
+    ``o2_o3_test`` containing only the O2/O3 rows from the held-out test split.
+    """
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"train_ratio must be in (0, 1), got {train_ratio}")
+    if not rows:
+        return {"train": [], "test": [], "o2_o3_test": []}
+
+    ordered_keys, groups = _group_corpus_by_function(rows)
+    shuffled_keys = list(ordered_keys)
+    rng = random.Random(seed)
+    rng.shuffle(shuffled_keys)
+
+    n_total = len(shuffled_keys)
+    n_train = max(1, min(n_total - 1, int(round(n_total * train_ratio)))) if n_total > 1 else n_total
+    train_keys = shuffled_keys[:n_train]
+    test_keys = shuffled_keys[n_train:]
+
+    train_rows = [row for key in train_keys for row in groups[key]]
+    test_rows = [row for key in test_keys for row in groups[key]]
+    o2_o3_test_rows = [
+        row for row in test_rows if str(row.get("opt") or "").strip().upper() in ("O2", "O3")
+    ]
+    return {
+        "train": train_rows,
+        "test": test_rows,
+        "o2_o3_test": o2_o3_test_rows,
+    }
+
+
+def _summarize_score_subset(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    evaluable = [row for row in rows if row.get("evaluable", True)]
+    denom = len(evaluable)
+
+    def _ghidra_raw(row: Dict[str, Any]) -> bool:
+        if "ghidra_pass" in row:
+            return bool(row["ghidra_pass"])
+        return bool(row.get("strict_pass", row.get("before_pass", False)))
+
+    def _ghidra_filt(row: Dict[str, Any]) -> bool:
+        if "filtered_pass" in row:
+            return bool(row["filtered_pass"])
+        return bool(row.get("compilable_pass", row.get("refined_pass", False)))
+
+    def _lenient(row: Dict[str, Any]) -> bool:
+        if "lenient_pass" in row:
+            return bool(row["lenient_pass"])
+        return _ghidra_filt(row)
+
+    def _ida_raw(row: Dict[str, Any]) -> bool:
+        return bool(row.get("ida_pass", False))
+
+    def _ida_filt(row: Dict[str, Any]) -> bool:
+        if "ida_filtered_pass" in row:
+            return bool(row["ida_filtered_pass"])
+        return _ida_raw(row)
+
+    def _pct(count: int) -> float:
+        return round(100.0 * count / denom, 2) if denom > 0 else 0.0
+
+    ghidra_raw_count = sum(1 for r in evaluable if _ghidra_raw(r))
+    ghidra_filt_count = sum(1 for r in evaluable if _ghidra_filt(r))
+    lenient_count = sum(1 for r in evaluable if _lenient(r))
+    ida_raw_count = sum(1 for r in evaluable if _ida_raw(r))
+    ida_filt_count = sum(1 for r in evaluable if _ida_filt(r))
+
+    gained_ghidra = sum(1 for r in evaluable if _ghidra_filt(r) and not _ghidra_raw(r))
+    broken_ghidra = sum(1 for r in evaluable if _ghidra_raw(r) and not _ghidra_filt(r))
+    gained_ida = sum(1 for r in evaluable if _ida_filt(r) and not _ida_raw(r))
+    broken_ida = sum(1 for r in evaluable if _ida_raw(r) and not _ida_filt(r))
+
+    return {
+        "logged_samples": len(rows),
+        "evaluable_denominator": denom,
+        "strict_pass_count": ghidra_raw_count,
+        "strict_avg": _pct(ghidra_raw_count),
+        "lenient_pass_count": lenient_count,
+        "lenient_avg": _pct(lenient_count),
+        "compilable_pass_count": ghidra_filt_count,
+        "compilable_avg": _pct(ghidra_filt_count),
+        "refined_pass_count": ghidra_filt_count,
+        "refined_regressions": broken_ghidra,
+        "ghidra_raw_pass_count": ghidra_raw_count,
+        "ghidra_raw_avg": _pct(ghidra_raw_count),
+        "ghidra_filtered_pass_count": ghidra_filt_count,
+        "ghidra_filtered_avg": _pct(ghidra_filt_count),
+        "ida_raw_pass_count": ida_raw_count,
+        "ida_raw_avg": _pct(ida_raw_count),
+        "ida_filtered_pass_count": ida_filt_count,
+        "ida_filtered_avg": _pct(ida_filt_count),
+        "filter_gained_ghidra": gained_ghidra,
+        "filter_broken_ghidra": broken_ghidra,
+        "filter_gained_ida": gained_ida,
+        "filter_broken_ida": broken_ida,
+    }
+
+
+def compute_split_metrics(
+    score_rows: List[Dict[str, Any]],
+    train_ratio: float = 0.70,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Compute pass rates and filter gains across full, 70% train, 30% test, and O2/O3 test splits."""
+    ordered_keys, _ = _group_corpus_by_function(score_rows) if score_rows else ([], {})
+    n_total = len(ordered_keys)
+    n_train = max(1, min(n_total - 1, int(round(n_total * train_ratio)))) if n_total > 1 else n_total
+    splits = split_humaneval_corpus(score_rows, train_ratio=train_ratio, seed=seed)
+
+    full_metrics = _summarize_score_subset(score_rows)
+    train_metrics = _summarize_score_subset(splits["train"])
+    test_metrics = _summarize_score_subset(splits["test"])
+    o2_o3_metrics = _summarize_score_subset(splits["o2_o3_test"])
+
+    train_metrics["unique_functions"] = n_train
+    test_metrics["unique_functions"] = n_total - n_train
+    o2_o3_metrics["unique_functions"] = n_total - n_train
+    full_metrics["unique_functions"] = n_total
+
+    return {
+        "seed": seed,
+        "train_ratio": train_ratio,
+        "total_unique_functions": n_total,
+        "train_unique_functions": n_train,
+        "test_unique_functions": n_total - n_train,
+        "full_corpus": full_metrics,
+        "train_split_70": train_metrics,
+        "test_split_30": test_metrics,
+        "test_o2_o3_high_opt": o2_o3_metrics,
+        "train_70": train_metrics,
+        "test_30": test_metrics,
+        "test_o2_o3": o2_o3_metrics,
+    }
 
 
 def averages_from_log(path: Path) -> Dict[str, Any]:

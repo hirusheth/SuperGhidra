@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import json
+import socket
 import struct
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 try:
     import numpy as np
@@ -27,6 +29,18 @@ try:
 except ImportError:
     np = None  # type: ignore
     HAS_NUMPY = False
+
+try:
+    import pypcode  # type: ignore
+    HAS_PYPCODE = True
+except ImportError:
+    pypcode = None  # type: ignore
+    HAS_PYPCODE = False
+
+try:
+    from superghidra.lifters import x86_decode
+except ImportError:
+    import x86_decode  # type: ignore
 
 
 # ==============================================================================
@@ -91,7 +105,11 @@ class PcodeOpcode(enum.IntEnum):
     FLOAT_FLOAT2FLOAT = 54
     FLOAT_TRUNC = 55
     CALLOTHER = 56
-
+    POPCOUNT = 57
+    MULTIEQUAL = 60
+    INDIRECT = 61
+    PTRADD = 62
+    PTRSUB = 63
 
 
 class AddressSpace(enum.Enum):
@@ -99,6 +117,10 @@ class AddressSpace(enum.Enum):
     REGISTER = "register"
     UNIQUE = "unique"      # Temporary SSA scratchpad
     CONST = "const"
+    CONSTANT = "const"     # Alias for CONST
+
+
+AddrSpace = AddressSpace
 
 
 @dataclasses.dataclass
@@ -107,6 +129,15 @@ class Varnode:
     space: AddressSpace
     offset: Any
     size: int = 8
+    reg_name: Optional[str] = dataclasses.field(default=None, compare=False)
+
+    @property
+    def name(self) -> Optional[str]:
+        if self.reg_name is not None:
+            return self.reg_name
+        if self.space == AddressSpace.REGISTER and isinstance(self.offset, str):
+            return self.offset
+        return None
 
     def __repr__(self) -> str:
         if self.space == AddressSpace.CONST:
@@ -2372,15 +2403,68 @@ class ARM64PcodeLifter:
             all_ops.extend(self.lift_instruction(pc, insn))
         return all_ops
 
+    def lift_bytes(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+    ) -> List[PcodeOp]:
+        """Lifts ARM64 bytes starting at `base_addr`, up to `max_insns` instructions."""
+        if max_insns is not None and max_insns >= 0:
+            code = code[: max_insns * 4]
+        return self.lift_block(base_addr, code)
+
 
 # ==============================================================================
-# Standalone x86_64 Zero-JVM P-Code Lifter Engine
+# Canonical Register Offset Tables (Shared across Builtin, pypcode & Daemon)
+# ==============================================================================
+
+_X86_REG_NAME_TO_IDX: Dict[str, int] = {}
+for _idx, _names in enumerate(zip(x86_decode.REG64, x86_decode.REG32, x86_decode.REG16, x86_decode.REG8)):
+    for _nm in _names:
+        _X86_REG_NAME_TO_IDX[_nm] = _idx
+for _idx, _nm in enumerate(("al", "cl", "dl", "bl", "ah", "ch", "dh", "bh")):
+    if _nm not in _X86_REG_NAME_TO_IDX:
+        _X86_REG_NAME_TO_IDX[_nm] = _idx & 3
+
+CANONICAL_REG_OFFSETS: Dict[str, int] = {
+    name: idx * 8 for name, idx in _X86_REG_NAME_TO_IDX.items()
+}
+for _i in range(31):
+    CANONICAL_REG_OFFSETS[f"x{_i}"] = _i * 8
+    CANONICAL_REG_OFFSETS[f"w{_i}"] = _i * 8
+    CANONICAL_REG_OFFSETS[f"r{_i}"] = CANONICAL_REG_OFFSETS.get(f"r{_i}", _i * 8)
+CANONICAL_REG_OFFSETS["sp"] = 31 * 8
+CANONICAL_REG_OFFSETS["wsp"] = 31 * 8
+CANONICAL_REG_OFFSETS["lr"] = 30 * 8
+CANONICAL_REG_OFFSETS["fp"] = 29 * 8
+for _i in range(32):
+    CANONICAL_REG_OFFSETS[f"d{_i}"] = 0x400 + _i * 16
+    CANONICAL_REG_OFFSETS[f"s{_i}"] = 0x400 + _i * 16
+    CANONICAL_REG_OFFSETS[f"v{_i}"] = 0x400 + _i * 16
+    CANONICAL_REG_OFFSETS[f"q{_i}"] = 0x400 + _i * 16
+    if _i < 16:
+        CANONICAL_REG_OFFSETS[f"xmm{_i}"] = 0x400 + _i * 16
+        CANONICAL_REG_OFFSETS[f"ymm{_i}"] = 0x400 + _i * 16
+CANONICAL_REG_OFFSETS.update({
+    "flag_n": FLAG_N_OFFSET, "nf": FLAG_N_OFFSET, "ng": FLAG_N_OFFSET, "sf": FLAG_N_OFFSET,
+    "flag_z": FLAG_Z_OFFSET, "zf": FLAG_Z_OFFSET, "zr": FLAG_Z_OFFSET,
+    "flag_c": FLAG_C_OFFSET, "cf": FLAG_C_OFFSET, "cy": FLAG_C_OFFSET,
+    "flag_v": FLAG_V_OFFSET, "of": FLAG_V_OFFSET, "vf": FLAG_V_OFFSET, "ov": FLAG_V_OFFSET,
+    "pf": 0x704, "af": 0x705, "df": 0x706, "tf": 0x707, "if": 0x708,
+    "rip": 0x780, "eip": 0x780, "pc": 0x780,
+})
+
+
+# ==============================================================================
+# Standalone x86_64 / x86 Zero-JVM P-Code Lifter Engine (backed by x86_decode)
 # ==============================================================================
 
 class X86_64PcodeLifter:
     """
-    Directly lifts variable-length x86_64 machine instructions into Ghidra P-Code IR
-    without JVM or SLEIGH binary dependencies.
+    Directly lifts variable-length x86_64 and x86 machine instructions into Ghidra P-Code IR
+    without JVM or SLEIGH binary dependencies, using `superghidra.lifters.x86_decode`
+    to decode prefixes, ModRM/SIB addressing, displacements, and immediates.
     Register mapping (8-byte intervals in AddressSpace.REGISTER):
       0: RAX (0x00), 1: RCX (0x08), 2: RDX (0x10), 3: RBX (0x18),
       4: RSP (0x20), 5: RBP (0x28), 6: RSI (0x30), 7: RDI (0x38),
@@ -2392,12 +2476,23 @@ class X86_64PcodeLifter:
     FLAG_C_OFFSET: int = 0x702
     FLAG_V_OFFSET: int = 0x703
 
-    def __init__(self):
+    def __init__(self, mode: int = 64):
+        self.mode = mode
         self._last_cmp_operands: Optional[Tuple[Varnode, Varnode, int, bool]] = None
 
     @staticmethod
     def _reg_varnode(reg_idx: int, size: int = 8) -> Varnode:
-        return Varnode(space=AddressSpace.REGISTER, offset=reg_idx * 8, size=size)
+        reg_name = None
+        if 0 <= reg_idx < 16:
+            if size == 8:
+                reg_name = x86_decode.REG64[reg_idx]
+            elif size == 4:
+                reg_name = x86_decode.REG32[reg_idx]
+            elif size == 2:
+                reg_name = x86_decode.REG16[reg_idx]
+            elif size == 1:
+                reg_name = x86_decode.REG8[reg_idx]
+        return Varnode(space=AddressSpace.REGISTER, offset=reg_idx * 8, size=size, reg_name=reg_name)
 
     @staticmethod
     def _const_varnode(val: int, size: int = 8) -> Varnode:
@@ -2423,6 +2518,10 @@ class X86_64PcodeLifter:
                 ops.append(PcodeOp(PcodeOpcode.INT_LESSEQUAL, [lhs, rhs], u_cond, pc=pc))
             elif cc == 0x7:  # JA / JNBE
                 ops.append(PcodeOp(PcodeOpcode.INT_LESS, [rhs, lhs], u_cond, pc=pc))
+            elif cc == 0x8:  # JS
+                ops.append(PcodeOp(PcodeOpcode.INT_SLESS, [lhs, rhs], u_cond, pc=pc))
+            elif cc == 0x9:  # JNS
+                ops.append(PcodeOp(PcodeOpcode.INT_SLESSEQUAL, [rhs, lhs], u_cond, pc=pc))
             elif cc == 0xC:  # JL / JNGE
                 ops.append(PcodeOp(PcodeOpcode.INT_SLESS, [lhs, rhs], u_cond, pc=pc))
             elif cc == 0xD:  # JGE / JNL
@@ -2434,292 +2533,529 @@ class X86_64PcodeLifter:
             else:
                 ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(1, 1)], u_cond, pc=pc))
         else:
-            flag_z = Varnode(AddressSpace.REGISTER, self.FLAG_Z_OFFSET, 1)
-            ops.append(PcodeOp(PcodeOpcode.COPY, [flag_z], u_cond, pc=pc))
+            flag_z = Varnode(AddressSpace.REGISTER, self.FLAG_Z_OFFSET, 1, reg_name="zf")
+            if cc == 0x5:
+                ops.append(PcodeOp(PcodeOpcode.INT_XOR, [flag_z, self._const_varnode(1, 1)], u_cond, pc=pc))
+            else:
+                ops.append(PcodeOp(PcodeOpcode.COPY, [flag_z], u_cond, pc=pc))
+        return ops
+
+    def _emit_mem_address(self, pc: int, insn: x86_decode.X86Insn, u_addr: Varnode) -> List[PcodeOp]:
+        """Emits P-Code ops computing effective address of `insn.mem` into `u_addr` (size 8)."""
+        ops: List[PcodeOp] = []
+        mem = insn.mem
+        if mem is None:
+            ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(0, 8)], u_addr, pc=pc))
+            return ops
+
+        if mem.rip_relative:
+            eff_addr = (pc + insn.length + mem.disp) & 0xFFFFFFFFFFFFFFFF
+            ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(eff_addr, 8)], u_addr, pc=pc))
+            return ops
+
+        cur_addr: Optional[Varnode] = None
+        if mem.base is not None:
+            base_idx = _X86_REG_NAME_TO_IDX.get(mem.base.lower(), 0)
+            cur_addr = self._reg_varnode(base_idx, 8)
+
+        if mem.index is not None:
+            idx_reg = _X86_REG_NAME_TO_IDX.get(mem.index.lower(), 0)
+            idx_vn = self._reg_varnode(idx_reg, 8)
+            if mem.scale > 1:
+                u_scaled = self._unique_varnode(10, 8)
+                ops.append(PcodeOp(PcodeOpcode.INT_MULT, [idx_vn, self._const_varnode(mem.scale, 8)], u_scaled, pc=pc))
+                idx_term = u_scaled
+            else:
+                idx_term = idx_vn
+
+            if cur_addr is None:
+                cur_addr = idx_term
+            else:
+                u_sum = self._unique_varnode(11, 8)
+                ops.append(PcodeOp(PcodeOpcode.INT_ADD, [cur_addr, idx_term], u_sum, pc=pc))
+                cur_addr = u_sum
+
+        disp = mem.disp
+        if cur_addr is None:
+            ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(disp & 0xFFFFFFFFFFFFFFFF, 8)], u_addr, pc=pc))
+        else:
+            if disp == 0 and cur_addr.space == AddressSpace.UNIQUE:
+                ops.append(PcodeOp(PcodeOpcode.COPY, [cur_addr], u_addr, pc=pc))
+            elif disp >= 0:
+                ops.append(PcodeOp(PcodeOpcode.INT_ADD, [cur_addr, self._const_varnode(disp, 8)], u_addr, pc=pc))
+            else:
+                ops.append(PcodeOp(PcodeOpcode.INT_SUB, [cur_addr, self._const_varnode(-disp, 8)], u_addr, pc=pc))
         return ops
 
     def lift_instruction(self, pc: int, code: bytes) -> Tuple[int, List[PcodeOp]]:
         """
-        Decodes a single x86_64 instruction at `code[0:]` and returns `(insn_len, pcode_ops)`.
+        Decodes a single x86_64 / x86 instruction at `code[0:]` using `x86_decode`
+        and returns `(insn_len, pcode_ops)`.
         """
         if not code:
             return 0, []
 
-        ops: List[PcodeOp] = []
-        idx = 0
-        n = len(code)
-
-        # 1. ENDBR64: F3 0F 1E FA
-        if n >= 4 and code[:4] == b"\xf3\x0f\x1e\xfa":
+        # 1. ENDBR64: F3 0F 1E FA / ENDBR32: F3 0F 1E FB
+        if len(code) >= 4 and code[:4] in (b"\xf3\x0f\x1e\xfa", b"\xf3\x0f\x1e\xfb"):
             return 4, []
 
-        # 2. Optional operand-size override (0x66) or REX prefix (0x40..0x4F)
-        op_size = 4
-        rex_w = 0
-        rex_r = 0
-        rex_x = 0
-        rex_b = 0
-        if idx < n and code[idx] == 0x66:
-            op_size = 2
-            idx += 1
-        if idx < n and 0x40 <= code[idx] <= 0x4F:
-            rex = code[idx]
-            rex_w = (rex >> 3) & 1
-            rex_r = (rex >> 2) & 1
-            rex_x = (rex >> 1) & 1
-            rex_b = rex & 1
-            if rex_w:
-                op_size = 8
-            idx += 1
+        insn = x86_decode.decode(code, offset=0, address=pc, mode=self.mode)
+        idx = max(1, insn.length)
+        if insn.invalid:
+            return idx, [PcodeOp(PcodeOpcode.UNIMPLEMENTED, [self._const_varnode(insn.opcode, 1)], pc=pc)]
 
-        if idx >= n:
-            return idx, [PcodeOp(PcodeOpcode.UNIMPLEMENTED, [], pc=pc)]
+        ops: List[PcodeOp] = []
+        opc = insn.opcode
+        op_size = 1 if insn.is_byte_op else insn.operand_size
+        reg = insn.reg
+        rm = insn.rm
+        reg_field = (insn.modrm >> 3) & 7 if insn.modrm is not None else 0
+        mod = (insn.modrm >> 6) & 3 if insn.modrm is not None else 3
+        stack_size = 8 if self.mode == 64 else 4
 
-        opc = code[idx]
-        idx += 1
+        # Map 0 (1-byte opcodes)
+        if insn.map == 0 and not insn.vex:
+            # NOP (0x90) or PAUSE (F3 90)
+            if opc == 0x90 and rm == 0:
+                return idx, []
 
-        # NOP (0x90)
-        if opc == 0x90 and rex_b == 0:
-            return idx, []
-
-        # RET (0xC3)
-        if opc == 0xC3:
-            rsp = self._reg_varnode(4, 8)
-            u_ret = self._unique_varnode(0, 8)
-            ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, 8), rsp], u_ret, pc=pc))
-            ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rsp, self._const_varnode(8, 8)], rsp, pc=pc))
-            ops.append(PcodeOp(PcodeOpcode.RETURN, [self._reg_varnode(0, 8)], pc=pc))
-            return idx, ops
-
-        # PUSH r64 (0x50..0x57)
-        if 0x50 <= opc <= 0x57:
-            reg = (opc - 0x50) | (rex_b << 3)
-            rsp = self._reg_varnode(4, 8)
-            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rsp, self._const_varnode(8, 8)], rsp, pc=pc))
-            ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, 8), rsp, self._reg_varnode(reg, 8)], pc=pc))
-            return idx, ops
-
-        # POP r64 (0x58..0x5F)
-        if 0x58 <= opc <= 0x5F:
-            reg = (opc - 0x58) | (rex_b << 3)
-            rsp = self._reg_varnode(4, 8)
-            ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, 8), rsp], self._reg_varnode(reg, 8), pc=pc))
-            ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rsp, self._const_varnode(8, 8)], rsp, pc=pc))
-            return idx, ops
-
-        # MOV r32/r64, imm32/imm64 (0xB8..0xBF)
-        if 0xB8 <= opc <= 0xBF:
-            reg = (opc - 0xB8) | (rex_b << 3)
-            if rex_w and idx + 8 <= n:
-                imm, = struct.unpack_from("<Q", code, idx)
-                idx += 8
-                ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(imm, 8)], self._reg_varnode(reg, 8), pc=pc))
-                return idx, ops
-            elif idx + 4 <= n:
-                imm, = struct.unpack_from("<I", code, idx)
-                idx += 4
-                ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(imm, 4)], self._reg_varnode(reg, 4), pc=pc))
+            # XCHG eax/rax, r (0x90..0x97 when rm != 0)
+            if 0x90 <= opc <= 0x97:
+                r_other = (opc - 0x90) | ((insn.rex & 1) << 3)
+                r0_vn = self._reg_varnode(0, op_size)
+                ro_vn = self._reg_varnode(r_other, op_size)
+                u_tmp = self._unique_varnode(0, op_size)
+                ops.append(PcodeOp(PcodeOpcode.COPY, [r0_vn], u_tmp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.COPY, [ro_vn], r0_vn, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.COPY, [u_tmp], ro_vn, pc=pc))
                 return idx, ops
 
-        # CALL rel32 (0xE8) or JMP rel32 (0xE9)
-        if opc in (0xE8, 0xE9) and idx + 4 <= n:
-            rel32, = struct.unpack_from("<i", code, idx)
-            idx += 4
-            target = (pc + idx + rel32) & 0xFFFFFFFFFFFFFFFF
-            p_op = PcodeOpcode.CALL if opc == 0xE8 else PcodeOpcode.BRANCH
-            ops.append(PcodeOp(p_op, [self._const_varnode(target, 8)], pc=pc))
-            return idx, ops
+            # 32-bit mode INC / DEC r32 (0x40..0x4F when mode == 32)
+            if self.mode == 32 and 0x40 <= opc <= 0x4F:
+                r_idx = opc & 7
+                r_vn = self._reg_varnode(r_idx, op_size)
+                p_op = PcodeOpcode.INT_ADD if opc < 0x48 else PcodeOpcode.INT_SUB
+                ops.append(PcodeOp(p_op, [r_vn, self._const_varnode(1, op_size)], r_vn, pc=pc))
+                return idx, ops
 
-        # JMP rel8 (0xEB)
-        if opc == 0xEB and idx + 1 <= n:
-            rel8, = struct.unpack_from("<b", code, idx)
-            idx += 1
-            target = (pc + idx + rel8) & 0xFFFFFFFFFFFFFFFF
-            ops.append(PcodeOp(PcodeOpcode.BRANCH, [self._const_varnode(target, 8)], pc=pc))
-            return idx, ops
+            # CBW / CWDE / CDQE (0x98)
+            if opc == 0x98:
+                src_sz = op_size // 2
+                ops.append(PcodeOp(PcodeOpcode.INT_SEXT, [self._reg_varnode(0, src_sz)], self._reg_varnode(0, op_size), pc=pc))
+                return idx, ops
 
-        # Jcc rel8 (0x70..0x7F)
-        if 0x70 <= opc <= 0x7F and idx + 1 <= n:
-            cc = opc & 0xF
-            rel8, = struct.unpack_from("<b", code, idx)
-            idx += 1
-            target = (pc + idx + rel8) & 0xFFFFFFFFFFFFFFFF
-            u_cond = self._unique_varnode(0, 1)
-            ops.extend(self._emit_jcc_cond(pc, cc, u_cond))
-            ops.append(PcodeOp(PcodeOpcode.CBRANCH, [self._const_varnode(target, 8), u_cond], pc=pc))
-            return idx, ops
+            # CWD / CDQ / CQO (0x99)
+            if opc == 0x99:
+                ops.append(PcodeOp(
+                    PcodeOpcode.INT_SRIGHT,
+                    [self._reg_varnode(0, op_size), self._const_varnode(op_size * 8 - 1, op_size)],
+                    self._reg_varnode(2, op_size),
+                    pc=pc,
+                ))
+                return idx, ops
 
-        # Two-byte opcode escape (0x0F)
-        if opc == 0x0F and idx < n:
-            opc2 = code[idx]
-            idx += 1
-            # Jcc rel32 (0x0F 0x80..0x8F)
-            if 0x80 <= opc2 <= 0x8F and idx + 4 <= n:
-                cc = opc2 & 0xF
-                rel32, = struct.unpack_from("<i", code, idx)
-                idx += 4
-                target = (pc + idx + rel32) & 0xFFFFFFFFFFFFFFFF
+            # LEAVE (0xC9): mov rsp, rbp; pop rbp
+            if opc == 0xC9:
+                rsp = self._reg_varnode(4, stack_size)
+                rbp = self._reg_varnode(5, stack_size)
+                ops.append(PcodeOp(PcodeOpcode.COPY, [rbp], rsp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, stack_size), rsp], rbp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rsp, self._const_varnode(stack_size, stack_size)], rsp, pc=pc))
+                return idx, ops
+
+            # RET (0xC3) or RET imm16 (0xC2)
+            if opc in (0xC3, 0xC2):
+                rsp = self._reg_varnode(4, stack_size)
+                u_ret = self._unique_varnode(0, stack_size)
+                pop_bytes = stack_size + (insn.imm if opc == 0xC2 and insn.imm is not None else 0)
+                ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, stack_size), rsp], u_ret, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rsp, self._const_varnode(pop_bytes, stack_size)], rsp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.RETURN, [self._reg_varnode(0, stack_size)], pc=pc))
+                return idx, ops
+
+            # PUSH r (0x50..0x57)
+            if 0x50 <= opc <= 0x57:
+                r_idx = (opc - 0x50) | ((insn.rex & 1) << 3)
+                rsp = self._reg_varnode(4, stack_size)
+                ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rsp, self._const_varnode(stack_size, stack_size)], rsp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, stack_size), rsp, self._reg_varnode(r_idx, stack_size)], pc=pc))
+                return idx, ops
+
+            # PUSH imm8/imm32 (0x6A, 0x68)
+            if opc in (0x6A, 0x68) and insn.imm is not None:
+                rsp = self._reg_varnode(4, stack_size)
+                ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rsp, self._const_varnode(stack_size, stack_size)], rsp, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, stack_size), rsp, self._const_varnode(insn.imm, stack_size)], pc=pc))
+                return idx, ops
+
+            # POP r (0x58..0x5F)
+            if 0x58 <= opc <= 0x5F:
+                r_idx = (opc - 0x58) | ((insn.rex & 1) << 3)
+                rsp = self._reg_varnode(4, stack_size)
+                ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, stack_size), rsp], self._reg_varnode(r_idx, stack_size), pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rsp, self._const_varnode(stack_size, stack_size)], rsp, pc=pc))
+                return idx, ops
+
+            # MOV r8, imm8 (0xB0..0xB7)
+            if 0xB0 <= opc <= 0xB7 and insn.imm is not None:
+                r_idx = (opc - 0xB0) | ((insn.rex & 1) << 3)
+                ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(insn.imm, 1)], self._reg_varnode(r_idx, 1), pc=pc))
+                return idx, ops
+
+            # MOV r16/r32/r64, imm (0xB8..0xBF)
+            if 0xB8 <= opc <= 0xBF and insn.imm is not None:
+                r_idx = (opc - 0xB8) | ((insn.rex & 1) << 3)
+                ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(insn.imm, op_size)], self._reg_varnode(r_idx, op_size), pc=pc))
+                return idx, ops
+
+            # CALL rel32 (0xE8) or JMP rel32/rel8 (0xE9, 0xEB)
+            if opc in (0xE8, 0xE9, 0xEB) and insn.target is not None:
+                p_op = PcodeOpcode.CALL if opc == 0xE8 else PcodeOpcode.BRANCH
+                ops.append(PcodeOp(p_op, [self._const_varnode(insn.target, 8)], pc=pc))
+                return idx, ops
+
+            # Jcc rel8 (0x70..0x7F)
+            if 0x70 <= opc <= 0x7F and insn.target is not None:
+                cc = opc & 0xF
                 u_cond = self._unique_varnode(0, 1)
                 ops.extend(self._emit_jcc_cond(pc, cc, u_cond))
-                ops.append(PcodeOp(PcodeOpcode.CBRANCH, [self._const_varnode(target, 8), u_cond], pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.CBRANCH, [self._const_varnode(insn.target, 8), u_cond], pc=pc))
                 return idx, ops
-            # IMUL r, r/m (0x0F 0xAF)
-            if opc2 == 0xAF and idx < n:
-                modrm = code[idx]
-                idx += 1
-                mod = (modrm >> 6) & 3
-                reg = ((modrm >> 3) & 7) | (rex_r << 3)
-                rm = (modrm & 7) | (rex_b << 3)
+
+            # Accumulator immediate ALU: ADD/OR/AND/SUB/XOR/CMP AL/AX/EAX/RAX, imm
+            if opc in (0x04, 0x05, 0x0C, 0x0D, 0x24, 0x25, 0x2C, 0x2D, 0x34, 0x35, 0x3C, 0x3D) and insn.imm is not None:
+                acc_vn = self._reg_varnode(0, op_size)
+                c_vn = self._const_varnode(insn.imm, op_size)
+                alu_grp = (opc >> 3) & 7
+                if alu_grp == 7:  # CMP
+                    self._last_cmp_operands = (acc_vn, c_vn, op_size, True)
+                    u_cmp = self._unique_varnode(0, op_size)
+                    ops.append(PcodeOp(PcodeOpcode.INT_SUB, [acc_vn, c_vn], u_cmp, pc=pc))
+                    return idx, ops
+                acc_map = {
+                    0: PcodeOpcode.INT_ADD,
+                    1: PcodeOpcode.INT_OR,
+                    4: PcodeOpcode.INT_AND,
+                    5: PcodeOpcode.INT_SUB,
+                    6: PcodeOpcode.INT_XOR,
+                }
+                if alu_grp in acc_map:
+                    ops.append(PcodeOp(acc_map[alu_grp], [acc_vn, c_vn], acc_vn, pc=pc))
+                    return idx, ops
+
+            # TEST AL/EAX/RAX, imm (0xA8, 0xA9)
+            if opc in (0xA8, 0xA9) and insn.imm is not None:
+                acc_vn = self._reg_varnode(0, op_size)
+                c_vn = self._const_varnode(insn.imm, op_size)
+                u_test = self._unique_varnode(0, op_size)
+                ops.append(PcodeOp(PcodeOpcode.INT_AND, [acc_vn, c_vn], u_test, pc=pc))
+                self._last_cmp_operands = (u_test, self._const_varnode(0, op_size), op_size, True)
+                return idx, ops
+
+            # 3-operand IMUL r, r/m, imm (0x69, 0x6B)
+            if opc in (0x69, 0x6B) and insn.imm is not None:
+                reg_vn = self._reg_varnode(reg, op_size)
+                c_vn = self._const_varnode(insn.imm, op_size)
                 if mod == 3:
-                    ops.append(PcodeOp(
-                        PcodeOpcode.INT_MULT,
-                        [self._reg_varnode(reg, op_size), self._reg_varnode(rm, op_size)],
-                        self._reg_varnode(reg, op_size),
-                        pc=pc
-                    ))
-                    return idx, ops
-
-        # ModR/M instructions: ALU reg/mem (01, 03, 09, 0B, 21, 23, 29, 2B, 31, 33, 39, 3B, 85, 89, 8B, 8D, 81, 83, C1, C7, D3)
-        if opc in (0x01, 0x03, 0x09, 0x0B, 0x21, 0x23, 0x29, 0x2B, 0x31, 0x33, 0x39, 0x3B, 0x85, 0x89, 0x8B, 0x8D, 0x81, 0x83, 0xC1, 0xC7, 0xD3) and idx < n:
-            modrm = code[idx]
-            idx += 1
-            mod = (modrm >> 6) & 3
-            reg_field = (modrm >> 3) & 7
-            reg = reg_field | (rex_r << 3)
-            rm_low = modrm & 7
-            rm = rm_low | (rex_b << 3)
-
-            # Handle SIB byte if mod != 3 and rm_low == 4
-            base_reg = rm
-            if mod != 3 and rm_low == 4 and idx < n:
-                sib = code[idx]
-                idx += 1
-                base_reg = (sib & 7) | (rex_b << 3)
-
-            disp = 0
-            rip_relative = False
-            if mod == 0 and rm_low == 5:
-                if idx + 4 <= n:
-                    disp, = struct.unpack_from("<i", code, idx)
-                    idx += 4
-                    rip_relative = True
-            elif mod == 1 and idx + 1 <= n:
-                disp, = struct.unpack_from("<b", code, idx)
-                idx += 1
-            elif mod == 2 and idx + 4 <= n:
-                disp, = struct.unpack_from("<i", code, idx)
-                idx += 4
-
-            # Immediate operands for 0x81, 0x83, 0xC1, 0xC7
-            imm_val = 0
-            if opc in (0x81, 0xC7) and idx + 4 <= n:
-                imm_val, = struct.unpack_from("<i", code, idx)
-                idx += 4
-            elif opc in (0x83, 0xC1) and idx + 1 <= n:
-                imm_val, = struct.unpack_from("<b", code, idx)
-                idx += 1
-
-            if mod == 3:
-                rm_vn = self._reg_varnode(rm, op_size)
-                reg_vn = self._reg_varnode(reg, op_size)
-                if opc == 0x89:  # MOV r/m, r
-                    ops.append(PcodeOp(PcodeOpcode.COPY, [reg_vn], rm_vn, pc=pc))
-                    return idx, ops
-                elif opc == 0x8B:  # MOV r, r/m
-                    ops.append(PcodeOp(PcodeOpcode.COPY, [rm_vn], reg_vn, pc=pc))
-                    return idx, ops
-                elif opc == 0xC7 and reg_field == 0:  # MOV r/m, imm32
-                    ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(imm_val, op_size)], rm_vn, pc=pc))
-                    return idx, ops
-                elif opc in (0x01, 0x03, 0x09, 0x0B, 0x21, 0x23, 0x29, 0x2B, 0x31, 0x33, 0x39, 0x3B):
-                    is_rm_dst = opc in (0x01, 0x09, 0x21, 0x29, 0x31, 0x39)
-                    lhs = rm_vn if is_rm_dst else reg_vn
-                    rhs = reg_vn if is_rm_dst else rm_vn
-                    dst = lhs
-                    if opc in (0x31, 0x33) and reg == rm:
-                        ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(0, op_size)], self._reg_varnode(reg, 8), pc=pc))
-                        return idx, ops
-                    if opc in (0x39, 0x3B):  # CMP
-                        self._last_cmp_operands = (lhs, rhs, op_size, True)
-                        u_cmp = self._unique_varnode(0, op_size)
-                        ops.append(PcodeOp(PcodeOpcode.INT_SUB, [lhs, rhs], u_cmp, pc=pc))
-                        return idx, ops
-                    alu_map = {
-                        0x01: PcodeOpcode.INT_ADD, 0x03: PcodeOpcode.INT_ADD,
-                        0x09: PcodeOpcode.INT_OR,  0x0B: PcodeOpcode.INT_OR,
-                        0x21: PcodeOpcode.INT_AND, 0x23: PcodeOpcode.INT_AND,
-                        0x29: PcodeOpcode.INT_SUB, 0x2B: PcodeOpcode.INT_SUB,
-                        0x31: PcodeOpcode.INT_XOR, 0x33: PcodeOpcode.INT_XOR,
-                    }
-                    ops.append(PcodeOp(alu_map[opc], [lhs, rhs], dst, pc=pc))
-                    return idx, ops
-                elif opc == 0x85:  # TEST r/m, r
-                    u_test = self._unique_varnode(0, op_size)
-                    ops.append(PcodeOp(PcodeOpcode.INT_AND, [rm_vn, reg_vn], u_test, pc=pc))
-                    self._last_cmp_operands = (u_test, self._const_varnode(0, op_size), op_size, True)
-                    return idx, ops
-                elif opc in (0x81, 0x83):  # Group 1 immediate ALU
-                    c_vn = self._const_varnode(imm_val, op_size)
-                    if reg_field == 0:  # ADD
-                        ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rm_vn, c_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 1:  # OR
-                        ops.append(PcodeOp(PcodeOpcode.INT_OR, [rm_vn, c_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 4:  # AND
-                        ops.append(PcodeOp(PcodeOpcode.INT_AND, [rm_vn, c_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 5:  # SUB
-                        ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rm_vn, c_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 6:  # XOR
-                        ops.append(PcodeOp(PcodeOpcode.INT_XOR, [rm_vn, c_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 7:  # CMP
-                        self._last_cmp_operands = (rm_vn, c_vn, op_size, True)
-                        u_cmp = self._unique_varnode(0, op_size)
-                        ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rm_vn, c_vn], u_cmp, pc=pc))
-                        return idx, ops
-                elif opc in (0xC1, 0xD3):  # Shift by imm8 or CL
-                    sh_vn = self._const_varnode(imm_val & 0x3F, op_size) if opc == 0xC1 else self._reg_varnode(1, 1)
-                    if reg_field == 4:  # SHL
-                        ops.append(PcodeOp(PcodeOpcode.INT_LEFT, [rm_vn, sh_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 5:  # SHR
-                        ops.append(PcodeOp(PcodeOpcode.INT_RIGHT, [rm_vn, sh_vn], rm_vn, pc=pc))
-                        return idx, ops
-                    elif reg_field == 7:  # SAR
-                        ops.append(PcodeOp(PcodeOpcode.INT_SRIGHT, [rm_vn, sh_vn], rm_vn, pc=pc))
-                        return idx, ops
-            else:
-                # Memory addressing: [rip + disp32] or [base_reg + disp]
-                u_addr = self._unique_varnode(0, 8)
-                if rip_relative:
-                    eff_addr = (pc + idx + disp) & 0xFFFFFFFFFFFFFFFF
-                    ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(eff_addr, 8)], u_addr, pc=pc))
+                    src_vn = self._reg_varnode(rm, op_size)
                 else:
-                    base_vn = self._reg_varnode(base_reg, 8)
-                    if disp >= 0:
-                        ops.append(PcodeOp(PcodeOpcode.INT_ADD, [base_vn, self._const_varnode(disp, 8)], u_addr, pc=pc))
-                    else:
-                        ops.append(PcodeOp(PcodeOpcode.INT_SUB, [base_vn, self._const_varnode(-disp, 8)], u_addr, pc=pc))
+                    u_addr = self._unique_varnode(0, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    src_vn = self._unique_varnode(1, op_size)
+                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, op_size), u_addr], src_vn, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_MULT, [src_vn, c_vn], reg_vn, pc=pc))
+                return idx, ops
 
+            # MOVSXD r64, r/m32 (0x63 in 64-bit mode)
+            if opc == 0x63 and self.mode == 64:
                 reg_vn = self._reg_varnode(reg, op_size)
-                if opc == 0x8D:  # LEA r, [addr]
-                    ops.append(PcodeOp(PcodeOpcode.COPY, [u_addr], reg_vn, pc=pc))
-                    return idx, ops
-                elif opc == 0x8B:  # MOV r, [addr]
-                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, op_size), u_addr], reg_vn, pc=pc))
-                    return idx, ops
-                elif opc == 0x89:  # MOV [addr], r
-                    ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, op_size), u_addr, reg_vn], pc=pc))
-                    return idx, ops
-                elif opc == 0xC7 and reg_field == 0:  # MOV [addr], imm32
-                    ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, op_size), u_addr, self._const_varnode(imm_val, op_size)], pc=pc))
-                    return idx, ops
+                if mod == 3:
+                    src_vn = self._reg_varnode(rm, 4)
+                else:
+                    u_addr = self._unique_varnode(0, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    src_vn = self._unique_varnode(1, 4)
+                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, 4), u_addr], src_vn, pc=pc))
+                if op_size > 4:
+                    ops.append(PcodeOp(PcodeOpcode.INT_SEXT, [src_vn], reg_vn, pc=pc))
+                else:
+                    ops.append(PcodeOp(PcodeOpcode.COPY, [src_vn], reg_vn, pc=pc))
+                return idx, ops
+
+            # ModR/M instructions in Map 0
+            if insn.modrm is not None:
+                imm_val = insn.imm if insn.imm is not None else 0
+                if mod == 3:
+                    rm_vn = self._reg_varnode(rm, op_size)
+                    reg_vn = self._reg_varnode(reg, op_size)
+                    if opc in (0x88, 0x89):  # MOV r/m, r
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [reg_vn], rm_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x8A, 0x8B):  # MOV r, r/m
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [rm_vn], reg_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x86, 0x87):  # XCHG r/m, r
+                        u_tmp = self._unique_varnode(0, op_size)
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [rm_vn], u_tmp, pc=pc))
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [reg_vn], rm_vn, pc=pc))
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [u_tmp], reg_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0xC6, 0xC7) and reg_field == 0:  # MOV r/m, imm
+                        ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(imm_val, op_size)], rm_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x00, 0x01, 0x02, 0x03, 0x08, 0x09, 0x0A, 0x0B,
+                                 0x20, 0x21, 0x22, 0x23, 0x28, 0x29, 0x2A, 0x2B,
+                                 0x30, 0x31, 0x32, 0x33, 0x38, 0x39, 0x3A, 0x3B):
+                        is_rm_dst = (opc & 2) == 0
+                        lhs = rm_vn if is_rm_dst else reg_vn
+                        rhs = reg_vn if is_rm_dst else rm_vn
+                        dst = lhs
+                        if (opc & 0x38) in (0x30, 0x28) and reg == rm and op_size in (4, 8):
+                            # xor reg, reg or sub reg, reg -> zero-idiom
+                            if (opc & 0x38) == 0x30:
+                                ops.append(PcodeOp(PcodeOpcode.COPY, [self._const_varnode(0, op_size)], self._reg_varnode(reg, 8), pc=pc))
+                                return idx, ops
+                        if (opc & 0x38) == 0x38:  # CMP
+                            self._last_cmp_operands = (lhs, rhs, op_size, True)
+                            u_cmp = self._unique_varnode(0, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [lhs, rhs], u_cmp, pc=pc))
+                            return idx, ops
+                        alu_map = {
+                            0x00: PcodeOpcode.INT_ADD,
+                            0x08: PcodeOpcode.INT_OR,
+                            0x20: PcodeOpcode.INT_AND,
+                            0x28: PcodeOpcode.INT_SUB,
+                            0x30: PcodeOpcode.INT_XOR,
+                        }
+                        ops.append(PcodeOp(alu_map[opc & 0x38], [lhs, rhs], dst, pc=pc))
+                        return idx, ops
+                    elif opc in (0x84, 0x85):  # TEST r/m, r
+                        u_test = self._unique_varnode(0, op_size)
+                        ops.append(PcodeOp(PcodeOpcode.INT_AND, [rm_vn, reg_vn], u_test, pc=pc))
+                        self._last_cmp_operands = (u_test, self._const_varnode(0, op_size), op_size, True)
+                        return idx, ops
+                    elif opc in (0x80, 0x81, 0x82, 0x83):  # Group 1 immediate ALU
+                        c_vn = self._const_varnode(imm_val, op_size)
+                        if reg_field == 0:  # ADD
+                            ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rm_vn, c_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 1:  # OR
+                            ops.append(PcodeOp(PcodeOpcode.INT_OR, [rm_vn, c_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 4:  # AND
+                            ops.append(PcodeOp(PcodeOpcode.INT_AND, [rm_vn, c_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 5:  # SUB
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rm_vn, c_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 6:  # XOR
+                            ops.append(PcodeOp(PcodeOpcode.INT_XOR, [rm_vn, c_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 7:  # CMP
+                            self._last_cmp_operands = (rm_vn, c_vn, op_size, True)
+                            u_cmp = self._unique_varnode(0, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rm_vn, c_vn], u_cmp, pc=pc))
+                            return idx, ops
+                    elif opc in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3):  # Shift by imm8, 1, or CL
+                        if opc in (0xD0, 0xD1):
+                            sh_vn = self._const_varnode(1, op_size)
+                        elif opc in (0xC0, 0xC1):
+                            sh_vn = self._const_varnode(imm_val & 0x3F, op_size)
+                        else:
+                            sh_vn = self._reg_varnode(1, 1)
+                        if reg_field == 4:  # SHL
+                            ops.append(PcodeOp(PcodeOpcode.INT_LEFT, [rm_vn, sh_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 5:  # SHR
+                            ops.append(PcodeOp(PcodeOpcode.INT_RIGHT, [rm_vn, sh_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 7:  # SAR
+                            ops.append(PcodeOp(PcodeOpcode.INT_SRIGHT, [rm_vn, sh_vn], rm_vn, pc=pc))
+                            return idx, ops
+                    elif opc in (0xF6, 0xF7):  # Group 3: TEST, NOT, NEG, MUL, IMUL
+                        if reg_field in (0, 1):  # TEST r, imm
+                            u_test = self._unique_varnode(0, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_AND, [rm_vn, self._const_varnode(imm_val, op_size)], u_test, pc=pc))
+                            self._last_cmp_operands = (u_test, self._const_varnode(0, op_size), op_size, True)
+                            return idx, ops
+                        elif reg_field == 2:  # NOT r
+                            ops.append(PcodeOp(PcodeOpcode.INT_NEGATE, [rm_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 3:  # NEG r
+                            self._last_cmp_operands = (self._const_varnode(0, op_size), rm_vn, op_size, True)
+                            ops.append(PcodeOp(PcodeOpcode.INT_2COMP, [rm_vn], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field in (4, 5):  # MUL / IMUL r
+                            acc_vn = self._reg_varnode(0, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_MULT, [acc_vn, rm_vn], acc_vn, pc=pc))
+                            return idx, ops
+                    elif opc in (0xFE, 0xFF):  # INC, DEC, CALL rm, JMP rm, PUSH rm
+                        if reg_field == 0:  # INC
+                            ops.append(PcodeOp(PcodeOpcode.INT_ADD, [rm_vn, self._const_varnode(1, op_size)], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 1:  # DEC
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [rm_vn, self._const_varnode(1, op_size)], rm_vn, pc=pc))
+                            return idx, ops
+                        elif reg_field == 2 and opc == 0xFF:  # CALLIND
+                            ops.append(PcodeOp(PcodeOpcode.CALLIND, [self._reg_varnode(rm, 8)], pc=pc))
+                            return idx, ops
+                        elif reg_field == 4 and opc == 0xFF:  # BRANCHIND
+                            ops.append(PcodeOp(PcodeOpcode.BRANCHIND, [self._reg_varnode(rm, 8)], pc=pc))
+                            return idx, ops
+                else:
+                    # Memory operand: compute effective address using x86_decode SIB + disp + RIP
+                    u_addr = self._unique_varnode(0, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    reg_vn = self._reg_varnode(reg, op_size)
+                    ram_vn = Varnode(AddressSpace.RAM, 0, op_size)
+
+                    if opc == 0x8D:  # LEA r, [addr]
+                        if op_size == 8:
+                            ops.append(PcodeOp(PcodeOpcode.COPY, [u_addr], reg_vn, pc=pc))
+                        else:
+                            ops.append(PcodeOp(PcodeOpcode.SUBPIECE, [u_addr, self._const_varnode(0, 4)], reg_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x8A, 0x8B):  # MOV r, [addr]
+                        ops.append(PcodeOp(PcodeOpcode.LOAD, [ram_vn, u_addr], reg_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x88, 0x89):  # MOV [addr], r
+                        ops.append(PcodeOp(PcodeOpcode.STORE, [ram_vn, u_addr, reg_vn], pc=pc))
+                        return idx, ops
+                    elif opc in (0xC6, 0xC7) and reg_field == 0:  # MOV [addr], imm
+                        ops.append(PcodeOp(PcodeOpcode.STORE, [ram_vn, u_addr, self._const_varnode(imm_val, op_size)], pc=pc))
+                        return idx, ops
+                    elif opc in (0x00, 0x01, 0x02, 0x03, 0x08, 0x09, 0x0A, 0x0B,
+                                 0x20, 0x21, 0x22, 0x23, 0x28, 0x29, 0x2A, 0x2B,
+                                 0x30, 0x31, 0x32, 0x33, 0x38, 0x39, 0x3A, 0x3B):
+                        u_mem = self._unique_varnode(1, op_size)
+                        ops.append(PcodeOp(PcodeOpcode.LOAD, [ram_vn, u_addr], u_mem, pc=pc))
+                        is_mem_dst = (opc & 2) == 0
+                        lhs = u_mem if is_mem_dst else reg_vn
+                        rhs = reg_vn if is_mem_dst else u_mem
+                        if (opc & 0x38) == 0x38:  # CMP
+                            self._last_cmp_operands = (lhs, rhs, op_size, True)
+                            u_cmp = self._unique_varnode(2, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [lhs, rhs], u_cmp, pc=pc))
+                            return idx, ops
+                        alu_map = {
+                            0x00: PcodeOpcode.INT_ADD,
+                            0x08: PcodeOpcode.INT_OR,
+                            0x20: PcodeOpcode.INT_AND,
+                            0x28: PcodeOpcode.INT_SUB,
+                            0x30: PcodeOpcode.INT_XOR,
+                        }
+                        if is_mem_dst:
+                            u_res = self._unique_varnode(2, op_size)
+                            ops.append(PcodeOp(alu_map[opc & 0x38], [lhs, rhs], u_res, pc=pc))
+                            ops.append(PcodeOp(PcodeOpcode.STORE, [ram_vn, u_addr, u_res], pc=pc))
+                        else:
+                            ops.append(PcodeOp(alu_map[opc & 0x38], [lhs, rhs], reg_vn, pc=pc))
+                        return idx, ops
+                    elif opc in (0x80, 0x81, 0x82, 0x83):  # Group 1 ALU [addr], imm
+                        u_mem = self._unique_varnode(1, op_size)
+                        ops.append(PcodeOp(PcodeOpcode.LOAD, [ram_vn, u_addr], u_mem, pc=pc))
+                        c_vn = self._const_varnode(imm_val, op_size)
+                        if reg_field == 7:  # CMP [addr], imm
+                            self._last_cmp_operands = (u_mem, c_vn, op_size, True)
+                            u_cmp = self._unique_varnode(2, op_size)
+                            ops.append(PcodeOp(PcodeOpcode.INT_SUB, [u_mem, c_vn], u_cmp, pc=pc))
+                            return idx, ops
+                        grp1_map = {
+                            0: PcodeOpcode.INT_ADD,
+                            1: PcodeOpcode.INT_OR,
+                            4: PcodeOpcode.INT_AND,
+                            5: PcodeOpcode.INT_SUB,
+                            6: PcodeOpcode.INT_XOR,
+                        }
+                        if reg_field in grp1_map:
+                            u_res = self._unique_varnode(2, op_size)
+                            ops.append(PcodeOp(grp1_map[reg_field], [u_mem, c_vn], u_res, pc=pc))
+                            ops.append(PcodeOp(PcodeOpcode.STORE, [ram_vn, u_addr, u_res], pc=pc))
+                            return idx, ops
+
+        # Map 1 (0x0F two-byte opcodes)
+        elif insn.map == 1 and not insn.vex:
+            # Jcc rel32 (0x0F 0x80..0x8F)
+            if 0x80 <= opc <= 0x8F and insn.target is not None:
+                cc = opc & 0xF
+                u_cond = self._unique_varnode(0, 1)
+                ops.extend(self._emit_jcc_cond(pc, cc, u_cond))
+                ops.append(PcodeOp(PcodeOpcode.CBRANCH, [self._const_varnode(insn.target, 8), u_cond], pc=pc))
+                return idx, ops
+
+            # SETcc r/m8 (0x0F 0x90..0x9F)
+            if 0x90 <= opc <= 0x9F and insn.modrm is not None:
+                cc = opc & 0xF
+                u_cond = self._unique_varnode(0, 1)
+                ops.extend(self._emit_jcc_cond(pc, cc, u_cond))
+                if mod == 3:
+                    ops.append(PcodeOp(PcodeOpcode.COPY, [u_cond], self._reg_varnode(rm, 1), pc=pc))
+                else:
+                    u_addr = self._unique_varnode(1, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    ops.append(PcodeOp(PcodeOpcode.STORE, [Varnode(AddressSpace.RAM, 0, 1), u_addr, u_cond], pc=pc))
+                return idx, ops
+
+            # CMOVcc r, r/m (0x0F 0x40..0x4F)
+            if 0x40 <= opc <= 0x4F and insn.modrm is not None:
+                cc = opc & 0xF
+                u_cond = self._unique_varnode(0, 1)
+                ops.extend(self._emit_jcc_cond(pc, cc, u_cond))
+                reg_vn = self._reg_varnode(reg, op_size)
+                if mod == 3:
+                    src_vn = self._reg_varnode(rm, op_size)
+                else:
+                    u_addr = self._unique_varnode(1, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    src_vn = self._unique_varnode(2, op_size)
+                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, op_size), u_addr], src_vn, pc=pc))
+                u_zext = self._unique_varnode(3, op_size)
+                u_mask = self._unique_varnode(4, op_size)
+                u_not_mask = self._unique_varnode(5, op_size)
+                u_t = self._unique_varnode(6, op_size)
+                u_f = self._unique_varnode(7, op_size)
+                ops.append(PcodeOp(PcodeOpcode.INT_ZEXT, [u_cond], u_zext, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_2COMP, [u_zext], u_mask, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_NEGATE, [u_mask], u_not_mask, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_AND, [src_vn, u_mask], u_t, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_AND, [reg_vn, u_not_mask], u_f, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_OR, [u_t, u_f], reg_vn, pc=pc))
+                return idx, ops
+
+            # IMUL r, r/m (0x0F 0xAF)
+            if opc == 0xAF and insn.modrm is not None:
+                reg_vn = self._reg_varnode(reg, op_size)
+                if mod == 3:
+                    src_vn = self._reg_varnode(rm, op_size)
+                else:
+                    u_addr = self._unique_varnode(0, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    src_vn = self._unique_varnode(1, op_size)
+                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, op_size), u_addr], src_vn, pc=pc))
+                ops.append(PcodeOp(PcodeOpcode.INT_MULT, [reg_vn, src_vn], reg_vn, pc=pc))
+                return idx, ops
+
+            # MOVZX (0x0F 0xB6, 0x0F 0xB7) and MOVSX (0x0F 0xBE, 0x0F 0xBF)
+            if opc in (0xB6, 0xB7, 0xBE, 0xBF) and insn.modrm is not None:
+                src_sz = 1 if opc in (0xB6, 0xBE) else 2
+                ext_op = PcodeOpcode.INT_ZEXT if opc in (0xB6, 0xB7) else PcodeOpcode.INT_SEXT
+                reg_vn = self._reg_varnode(reg, op_size)
+                if mod == 3:
+                    src_vn = self._reg_varnode(rm, src_sz)
+                else:
+                    u_addr = self._unique_varnode(0, 8)
+                    ops.extend(self._emit_mem_address(pc, insn, u_addr))
+                    src_vn = self._unique_varnode(1, src_sz)
+                    ops.append(PcodeOp(PcodeOpcode.LOAD, [Varnode(AddressSpace.RAM, 0, src_sz), u_addr], src_vn, pc=pc))
+                ops.append(PcodeOp(ext_op, [src_vn], reg_vn, pc=pc))
+                return idx, ops
+
+            # Multi-byte NOP (0x0F 0x1F /0)
+            if opc == 0x1F:
+                return idx, []
 
         ops.append(PcodeOp(PcodeOpcode.UNIMPLEMENTED, [self._const_varnode(opc, 1)], pc=pc))
-        return max(1, idx), ops
+        return idx, ops
 
     def lift_block(self, base_pc: int, machine_bytes: bytes) -> List[PcodeOp]:
         """Lifts a contiguous byte slice of variable-length x86_64 instructions."""
@@ -2733,6 +3069,543 @@ class X86_64PcodeLifter:
             all_ops.extend(insn_ops)
             offset += consumed
         return all_ops
+
+    def lift_bytes(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+    ) -> List[PcodeOp]:
+        """Lifts x86_64 / x86 bytes starting at `base_addr`, up to `max_insns` instructions."""
+        all_ops: List[PcodeOp] = []
+        offset = 0
+        n = len(code)
+        count = 0
+        while offset < n:
+            if max_insns is not None and count >= max_insns:
+                break
+            consumed, insn_ops = self.lift_instruction(base_addr + offset, code[offset:])
+            if consumed <= 0:
+                break
+            all_ops.extend(insn_ops)
+            offset += consumed
+            count += 1
+        return all_ops
+
+
+# ==============================================================================
+# Pypcode SLEIGH Backend
+# ==============================================================================
+
+class PypcodeSleighBackend:
+    """
+    Lifts raw machine code bytes into SuperGhidra `PcodeOp`s using `pypcode` SLEIGH bindings.
+    Supports full SLEIGH language IDs (`"x86:LE:64:default"`, `"x86:LE:32:default"`,
+    `"AArch64:LE:64:v8A"`, `"ARM:LE:32:v8"`) and short architecture aliases
+    (`"x86_64"`, `"x86"`, `"arm64"`, `"arm"`).
+    """
+
+    LANGUAGE_ALIASES: Dict[str, str] = {
+        "x86_64": "x86:LE:64:default",
+        "amd64": "x86:LE:64:default",
+        "x64": "x86:LE:64:default",
+        "x86": "x86:LE:32:default",
+        "i386": "x86:LE:32:default",
+        "x86_32": "x86:LE:32:default",
+        "arm64": "AArch64:LE:64:v8A",
+        "aarch64": "AArch64:LE:64:v8A",
+        "arm": "ARM:LE:32:v8",
+        "arm32": "ARM:LE:32:v8",
+    }
+
+    _SLEIGH_X86_OFFSET_TO_NAME: Dict[Tuple[int, int], str] = {
+        (0x00, 8): "rax", (0x00, 4): "eax", (0x00, 2): "ax", (0x00, 1): "al",
+        (0x08, 8): "rcx", (0x08, 4): "ecx", (0x08, 2): "cx", (0x08, 1): "cl",
+        (0x10, 8): "rdx", (0x10, 4): "edx", (0x10, 2): "dx", (0x10, 1): "dl",
+        (0x18, 8): "rbx", (0x18, 4): "ebx", (0x18, 2): "bx", (0x18, 1): "bl",
+        (0x20, 8): "rsp", (0x20, 4): "esp", (0x20, 2): "sp", (0x20, 1): "spl",
+        (0x28, 8): "rbp", (0x28, 4): "ebp", (0x28, 2): "bp", (0x28, 1): "bpl",
+        (0x30, 8): "rsi", (0x30, 4): "esi", (0x30, 2): "si", (0x30, 1): "sil",
+        (0x38, 8): "rdi", (0x38, 4): "edi", (0x38, 2): "di", (0x38, 1): "dil",
+        (0x80, 8): "r8",  (0x80, 4): "r8d", (0x80, 2): "r8w", (0x80, 1): "r8b",
+        (0x88, 8): "r9",  (0x88, 4): "r9d", (0x88, 2): "r9w", (0x88, 1): "r9b",
+        (0x90, 8): "r10", (0x90, 4): "r10d", (0x90, 2): "r10w", (0x90, 1): "r10b",
+        (0x98, 8): "r11", (0x98, 4): "r11d", (0x98, 2): "r11w", (0x98, 1): "r11b",
+        (0xA0, 8): "r12", (0xA0, 4): "r12d", (0xA0, 2): "r12w", (0xA0, 1): "r12b",
+        (0xA8, 8): "r13", (0xA8, 4): "r13d", (0xA8, 2): "r13w", (0xA8, 1): "r13b",
+        (0xB0, 8): "r14", (0xB0, 4): "r14d", (0xB0, 2): "r14w", (0xB0, 1): "r14b",
+        (0xB8, 8): "r15", (0xB8, 4): "r15d", (0xB8, 2): "r15w", (0xB8, 1): "r15b",
+        (0x200, 1): "cf", (0x202, 1): "pf", (0x204, 1): "af",
+        (0x206, 1): "zf", (0x207, 1): "sf", (0x20b, 1): "of",
+    }
+
+    _SLEIGH_ARM64_OFFSET_TO_NAME: Dict[Tuple[int, int], str] = {
+        **{(0x4000 + i * 8, 8): f"x{i}" for i in range(31)},
+        **{(0x4000 + i * 8, 4): f"w{i}" for i in range(31)},
+        **{(i * 8, 8): f"x{i}" for i in range(31)},
+        **{(i * 8, 4): f"w{i}" for i in range(31)},
+        (0x08, 8): "sp", (31 * 8, 8): "sp",
+        (0x200, 1): "ng", (0x201, 1): "zr", (0x202, 1): "cy", (0x203, 1): "ov",
+    }
+
+    def __init__(self, lang_id: str = "x86_64", context: Optional[Any] = None):
+        self.lang_id = lang_id
+        self.language_id = self.resolve_language_id(lang_id)
+        if context is not None:
+            self.ctx = context
+        else:
+            pp = pypcode
+            if pp is None:
+                try:
+                    import pypcode as _pp  # type: ignore
+                    pp = _pp
+                except ImportError as exc:
+                    raise ImportError("pypcode is not installed; install pypcode to use PypcodeSleighBackend") from exc
+            self.ctx = pp.Context(self.language_id)
+
+        self._reg_exact: Dict[Tuple[int, int], str] = {}
+        self._reg_by_offset: Dict[int, str] = {}
+        self._build_register_maps()
+
+    @classmethod
+    def resolve_language_id(cls, lang_or_arch: str) -> str:
+        key = lang_or_arch.strip()
+        return cls.LANGUAGE_ALIASES.get(key.lower(), key)
+
+    @classmethod
+    def is_available(cls) -> bool:
+        if pypcode is not None:
+            return True
+        try:
+            import pypcode as _pp  # type: ignore
+            return _pp is not None
+        except ImportError:
+            return False
+
+    def _build_register_maps(self) -> None:
+        regs = getattr(self.ctx, "registers", None)
+        if isinstance(regs, dict):
+            for r_name, r_vn in regs.items():
+                low_name = str(r_name).lower()
+                off = int(getattr(r_vn, "offset", 0))
+                sz = int(getattr(r_vn, "size", 8))
+                if (off, sz) not in self._reg_exact or low_name in CANONICAL_REG_OFFSETS:
+                    self._reg_exact[(off, sz)] = low_name
+                if off not in self._reg_by_offset or low_name in CANONICAL_REG_OFFSETS:
+                    self._reg_by_offset[off] = low_name
+
+    def _resolve_register_name(self, vn: Any) -> Optional[str]:
+        off = getattr(vn, "offset", 0)
+        sz = int(getattr(vn, "size", 8))
+        if isinstance(off, str):
+            return off.lower()
+        off_int = int(off)
+        if (off_int, sz) in self._reg_exact:
+            return self._reg_exact[(off_int, sz)]
+        get_reg_fn = getattr(vn, "getRegisterName", None)
+        if callable(get_reg_fn):
+            try:
+                rn = get_reg_fn()
+                if rn:
+                    return str(rn).lower()
+            except Exception:
+                pass
+        if off_int in self._reg_by_offset:
+            return self._reg_by_offset[off_int]
+        if "aarch64" in self.language_id.lower() or "arm" in self.language_id.lower():
+            if (off_int, sz) in self._SLEIGH_ARM64_OFFSET_TO_NAME:
+                return self._SLEIGH_ARM64_OFFSET_TO_NAME[(off_int, sz)]
+        else:
+            if (off_int, sz) in self._SLEIGH_X86_OFFSET_TO_NAME:
+                return self._SLEIGH_X86_OFFSET_TO_NAME[(off_int, sz)]
+        return None
+
+    def _translate_varnode(self, vn: Any) -> Varnode:
+        raw_space = getattr(vn, "space", None)
+        if isinstance(raw_space, AddressSpace):
+            space_name = raw_space.value
+        elif isinstance(raw_space, str):
+            space_name = raw_space.lower()
+        else:
+            space_name = str(getattr(raw_space, "name", "ram")).lower()
+
+        size = int(getattr(vn, "size", 8))
+        raw_offset = getattr(vn, "offset", 0)
+
+        if space_name in ("const", "constant"):
+            off_val = int(raw_offset, 16) if isinstance(raw_offset, str) and raw_offset.startswith("0x") else int(raw_offset)
+            return Varnode(space=AddrSpace.CONSTANT, offset=off_val, size=size)
+        elif space_name in ("unique", "uniq"):
+            off_val = int(raw_offset, 16) if isinstance(raw_offset, str) and raw_offset.startswith("0x") else int(raw_offset)
+            return Varnode(space=AddrSpace.UNIQUE, offset=off_val, size=size)
+        elif space_name in ("register", "reg"):
+            reg_name = self._resolve_register_name(vn)
+            if reg_name is not None and reg_name in CANONICAL_REG_OFFSETS:
+                canon_off = CANONICAL_REG_OFFSETS[reg_name]
+            elif isinstance(raw_offset, int):
+                canon_off = raw_offset if raw_offset >= 0x700 else (0x800 + raw_offset)
+            else:
+                canon_off = 0x800
+            return Varnode(space=AddrSpace.REGISTER, offset=canon_off, size=size, reg_name=reg_name)
+        else:
+            off_val = int(raw_offset, 16) if isinstance(raw_offset, str) and raw_offset.startswith("0x") else int(raw_offset)
+            return Varnode(space=AddrSpace.RAM, offset=off_val, size=size)
+
+    @staticmethod
+    def _translate_opcode(raw_opcode: Any) -> Optional[PcodeOpcode]:
+        if isinstance(raw_opcode, PcodeOpcode):
+            return raw_opcode
+        op_name = getattr(raw_opcode, "name", None) or str(raw_opcode)
+        if "." in op_name:
+            op_name = op_name.split(".")[-1]
+        op_name = op_name.upper()
+        if op_name == "IMARK":
+            return None
+        if hasattr(PcodeOpcode, op_name):
+            return PcodeOpcode[op_name]
+        return PcodeOpcode.UNIMPLEMENTED
+
+    def lift_bytes(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+    ) -> List[PcodeOp]:
+        """Lifts `code` at `base_addr` via `pypcode` into canonical `PcodeOp`s."""
+        if not code:
+            return []
+        try:
+            tx = self.ctx.translate(code, base_address=base_addr, max_instructions=max_insns or 0)
+        except TypeError:
+            tx = self.ctx.translate(code, base_addr, max_insns or 0)
+
+        raw_ops = getattr(tx, "ops", tx)
+        ops: List[PcodeOp] = []
+        current_pc = base_addr
+
+        for raw_op in raw_ops:
+            raw_opc = getattr(raw_op, "opcode", None)
+            opc_name = (getattr(raw_opc, "name", None) or str(raw_opc)).split(".")[-1].upper()
+            raw_inputs = list(getattr(raw_op, "inputs", []))
+
+            if opc_name == "IMARK":
+                if raw_inputs:
+                    current_pc = int(getattr(raw_inputs[0], "offset", current_pc))
+                continue
+
+            opcode = self._translate_opcode(raw_opc)
+            if opcode is None:
+                continue
+
+            op_pc = getattr(raw_op, "pc", None)
+            if op_pc is None:
+                seq = getattr(raw_op, "seq", None)
+                if seq is not None:
+                    target = getattr(seq, "target", None) or getattr(seq, "pc", None)
+                    if target is not None:
+                        op_pc = int(getattr(target, "offset", target))
+            if op_pc is None:
+                op_pc = current_pc
+
+            inputs = [self._translate_varnode(v) for v in raw_inputs]
+            raw_out = getattr(raw_op, "output", None)
+            output = self._translate_varnode(raw_out) if raw_out is not None else None
+            ops.append(PcodeOp(opcode=opcode, inputs=inputs, output=output, pc=int(op_pc)))
+
+        return ops
+
+
+# ==============================================================================
+# Persistent SuperGhidra Oracle Daemon P-Code RPC Backend
+# ==============================================================================
+
+class _DualAvailableDescriptor:
+    """Allows `DaemonPcodeBackend.is_available()` to be called on class or instance."""
+
+    def __init__(self, func: Callable[..., bool]):
+        self.func = func
+
+    def __get__(self, instance: Optional[DaemonPcodeBackend], owner: Any = None) -> Callable[..., bool]:
+        if instance is None:
+            def _cls_check(host: str = "127.0.0.1", port: int = 5073, timeout: float = 0.25) -> bool:
+                return self.func(None, host=host, port=port, timeout=timeout)
+            return _cls_check
+
+        def _inst_check() -> bool:
+            return self.func(instance, host=instance.host, port=instance.port, timeout=instance.timeout)
+        return _inst_check
+
+
+class DaemonPcodeBackend:
+    """
+    Connects to the persistent SuperGhidra Oracle Daemon over TCP JSON RPC
+    (`host="127.0.0.1"`, `port=5073`) and translates daemon P-code op dicts
+    into canonical `List[PcodeOp]`.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 5073,
+        timeout: float = 2.0,
+        arch: str = "x86_64",
+        rpc_client: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.arch = arch
+        self.rpc_client = rpc_client
+
+    @_DualAvailableDescriptor
+    def is_available(
+        self: Optional[DaemonPcodeBackend],
+        host: str = "127.0.0.1",
+        port: int = 5073,
+        timeout: float = 0.25,
+    ) -> bool:
+        if self is not None and self.rpc_client is not None:
+            return True
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def parse_varnode_dict(vn_data: Union[Dict[str, Any], Varnode]) -> Varnode:
+        if isinstance(vn_data, Varnode):
+            return vn_data
+        raw_space = str(vn_data.get("space", "ram")).lower()
+        size = int(vn_data.get("size", 8))
+        raw_off = vn_data.get("offset", vn_data.get("value", 0))
+        reg_name = vn_data.get("reg_name") or vn_data.get("name")
+        if isinstance(reg_name, str):
+            reg_name = reg_name.lower()
+
+        if raw_space in ("const", "constant"):
+            off = int(raw_off, 16) if isinstance(raw_off, str) and raw_off.startswith("0x") else int(raw_off)
+            return Varnode(space=AddrSpace.CONSTANT, offset=off, size=size)
+        elif raw_space in ("unique", "uniq"):
+            off = int(raw_off, 16) if isinstance(raw_off, str) and raw_off.startswith("0x") else int(raw_off)
+            return Varnode(space=AddrSpace.UNIQUE, offset=off, size=size)
+        elif raw_space in ("register", "reg"):
+            if isinstance(raw_off, str) and not raw_off.startswith("0x") and not raw_off.isdigit():
+                reg_name = raw_off.lower()
+            if reg_name and reg_name in CANONICAL_REG_OFFSETS:
+                off = CANONICAL_REG_OFFSETS[reg_name]
+            elif isinstance(raw_off, str) and raw_off.startswith("0x"):
+                off = int(raw_off, 16)
+            else:
+                off = int(raw_off)
+            return Varnode(space=AddrSpace.REGISTER, offset=off, size=size, reg_name=reg_name)
+        else:
+            off = int(raw_off, 16) if isinstance(raw_off, str) and raw_off.startswith("0x") else int(raw_off)
+            return Varnode(space=AddrSpace.RAM, offset=off, size=size)
+
+    @classmethod
+    def parse_pcode_ops(cls, raw_ops: List[Dict[str, Any]], default_pc: int = 0x1000) -> List[PcodeOp]:
+        ops: List[PcodeOp] = []
+        for item in raw_ops:
+            if isinstance(item, PcodeOp):
+                ops.append(item)
+                continue
+            raw_opc = item.get("opcode") or item.get("mnemonic") or "UNIMPLEMENTED"
+            if isinstance(raw_opc, PcodeOpcode):
+                opcode = raw_opc
+            elif isinstance(raw_opc, int):
+                opcode = PcodeOpcode(raw_opc)
+            else:
+                opc_str = str(raw_opc).split(".")[-1].upper()
+                opcode = PcodeOpcode[opc_str] if hasattr(PcodeOpcode, opc_str) else PcodeOpcode.UNIMPLEMENTED
+
+            raw_pc = item.get("seq_addr", item.get("pc", item.get("address", default_pc)))
+            if isinstance(raw_pc, str):
+                pc_val = int(raw_pc, 16) if raw_pc.startswith("0x") else int(raw_pc)
+            else:
+                pc_val = int(raw_pc)
+
+            raw_out = item.get("output")
+            output = cls.parse_varnode_dict(raw_out) if raw_out is not None else None
+            inputs = [cls.parse_varnode_dict(v) for v in item.get("inputs", [])]
+
+            if opcode == PcodeOpcode.LOAD and len(inputs) == 1:
+                inputs.insert(0, Varnode(AddrSpace.RAM, 0, output.size if output else 8))
+            elif opcode == PcodeOpcode.STORE and len(inputs) == 2:
+                inputs.insert(0, Varnode(AddrSpace.RAM, 0, inputs[1].size))
+
+            ops.append(PcodeOp(opcode=opcode, inputs=inputs, output=output, pc=pc_val))
+        return ops
+
+    def _send_rpc(self, payload: Dict[str, Any]) -> Any:
+        if self.rpc_client is not None:
+            return self.rpc_client(payload)
+
+        msg = (json.dumps(payload) + "\n").encode("utf-8")
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+            sock.sendall(msg)
+            chunks: List[bytes] = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                if b"\n" in data:
+                    break
+        raw_text = b"".join(chunks).decode("utf-8").strip()
+        if not raw_text:
+            raise RuntimeError("Empty response from SuperGhidra Oracle Daemon")
+        return json.loads(raw_text.splitlines()[0])
+
+    def lift_bytes(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+    ) -> List[PcodeOp]:
+        """Requests P-Code operations from the persistent SuperGhidra daemon over TCP JSON RPC."""
+        req: Dict[str, Any] = {
+            "cmd": "pcode",
+            "address": hex(base_addr),
+            "max_insns": max_insns,
+            "arch": self.arch,
+            "bytes": code.hex() if code else "",
+        }
+        resp = self._send_rpc(req)
+        if isinstance(resp, list):
+            raw_ops = resp
+        elif isinstance(resp, dict):
+            if resp.get("status") == "error" or "error" in resp:
+                raise RuntimeError(f"Daemon P-code RPC error: {resp.get('error', resp)}")
+            raw_ops = resp.get("ops") or resp.get("pcode") or resp.get("result") or []
+        else:
+            raw_ops = []
+        return self.parse_pcode_ops(raw_ops, default_pc=base_addr)
+
+
+# ==============================================================================
+# Unified Multi-Tier P-Code Lifter (pypcode -> daemon -> builtin)
+# ==============================================================================
+
+class UnifiedPcodeLifter:
+    """
+    Multi-tier P-Code lifter supporting `arch="arm64" | "x86_64" | "x86"`.
+    Backend resolution order for `backend="auto"`:
+      1. `PypcodeSleighBackend` (if `pypcode` is installed or injected)
+      2. `DaemonPcodeBackend` (if daemon is reachable or injected)
+      3. Built-in pure-Python lifters (`ARM64PcodeLifter` or `X86_64PcodeLifter`)
+    """
+
+    def __init__(
+        self,
+        arch: str = "arm64",
+        backend: str = "auto",
+        daemon_host: str = "127.0.0.1",
+        daemon_port: int = 5073,
+        daemon_timeout: float = 0.5,
+        daemon_backend: Optional[DaemonPcodeBackend] = None,
+        pypcode_backend: Optional[PypcodeSleighBackend] = None,
+    ):
+        self.arch = self._normalize_arch(arch)
+        self.backend = backend.lower()
+        self.daemon_host = daemon_host
+        self.daemon_port = daemon_port
+        self.daemon_timeout = daemon_timeout
+        self.daemon_backend = daemon_backend
+        self.pypcode_backend = pypcode_backend
+
+        if self.arch == "arm64":
+            self.builtin_lifter: Union[ARM64PcodeLifter, X86_64PcodeLifter] = ARM64PcodeLifter()
+        elif self.arch == "x86_64":
+            self.builtin_lifter = X86_64PcodeLifter(mode=64)
+        else:
+            self.builtin_lifter = X86_64PcodeLifter(mode=32)
+
+    @staticmethod
+    def _normalize_arch(arch: str) -> str:
+        low = arch.strip().lower()
+        if low in ("arm64", "aarch64", "aarch64:le:64:v8a"):
+            return "arm64"
+        if low in ("x86_64", "amd64", "x64", "x86:le:64:default"):
+            return "x86_64"
+        if low in ("x86", "i386", "x86_32", "x86:le:32:default"):
+            return "x86"
+        raise ValueError(f"Unsupported architecture '{arch}'; expected 'arm64', 'x86_64', or 'x86'")
+
+    def lift_with_provenance(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+        backend: Optional[str] = None,
+    ) -> Tuple[List[PcodeOp], str]:
+        """Lifts `code` and returns `(ops, backend_used)` where `backend_used` is `'pypcode' | 'daemon' | 'builtin'`."""
+        choice = (backend or self.backend).strip().lower()
+        if choice not in ("auto", "pypcode", "daemon", "builtin"):
+            raise ValueError(f"Unknown backend '{choice}'; expected 'auto', 'pypcode', 'daemon', or 'builtin'")
+
+        if choice == "pypcode":
+            pp_backend = self.pypcode_backend or PypcodeSleighBackend(self.arch)
+            return pp_backend.lift_bytes(code, base_addr=base_addr, max_insns=max_insns), "pypcode"
+
+        if choice == "daemon":
+            dm_backend = self.daemon_backend or DaemonPcodeBackend(
+                host=self.daemon_host,
+                port=self.daemon_port,
+                timeout=self.daemon_timeout,
+                arch=self.arch,
+            )
+            if not dm_backend.is_available():
+                raise RuntimeError(f"Daemon backend not reachable at {dm_backend.host}:{dm_backend.port}")
+            return dm_backend.lift_bytes(code, base_addr=base_addr, max_insns=max_insns), "daemon"
+
+        if choice == "builtin":
+            return self.builtin_lifter.lift_bytes(code, base_addr=base_addr, max_insns=max_insns), "builtin"
+
+        # choice == "auto"
+        if self.pypcode_backend is not None or PypcodeSleighBackend.is_available():
+            try:
+                pp_backend = self.pypcode_backend or PypcodeSleighBackend(self.arch)
+                ops = pp_backend.lift_bytes(code, base_addr=base_addr, max_insns=max_insns)
+                return ops, "pypcode"
+            except Exception:
+                pass
+
+        if self.daemon_backend is not None and self.daemon_backend.is_available():
+            try:
+                ops = self.daemon_backend.lift_bytes(code, base_addr=base_addr, max_insns=max_insns)
+                return ops, "daemon"
+            except Exception:
+                pass
+        elif self.daemon_port != 5073 and DaemonPcodeBackend.is_available(self.daemon_host, self.daemon_port, self.daemon_timeout):
+            try:
+                dm_backend = DaemonPcodeBackend(
+                    host=self.daemon_host,
+                    port=self.daemon_port,
+                    timeout=self.daemon_timeout,
+                    arch=self.arch,
+                )
+                ops = dm_backend.lift_bytes(code, base_addr=base_addr, max_insns=max_insns)
+                return ops, "daemon"
+            except Exception:
+                pass
+
+        return self.builtin_lifter.lift_bytes(code, base_addr=base_addr, max_insns=max_insns), "builtin"
+
+    def lift_bytes(
+        self,
+        code: bytes,
+        base_addr: int = 0x1000,
+        max_insns: Optional[int] = None,
+        backend: Optional[str] = None,
+    ) -> List[PcodeOp]:
+        """Lifts `code` into `List[PcodeOp]` using configured backend resolution order."""
+        ops, _ = self.lift_with_provenance(code, base_addr=base_addr, max_insns=max_insns, backend=backend)
+        return ops
+
+    def lift_block(self, base_pc: int, machine_bytes: bytes) -> List[PcodeOp]:
+        """Compatibility alias for `lift_bytes(machine_bytes, base_addr=base_pc)`."""
+        return self.lift_bytes(machine_bytes, base_addr=base_pc)
 
 
 # ==============================================================================
@@ -2782,4 +3655,5 @@ class PcodeGraphBuilder:
             "connected_nodes": num_ops
         }
         return adj, meta
+
 
