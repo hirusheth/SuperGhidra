@@ -3,7 +3,7 @@ superghidra.__main__
 ====================
 
 Unified CLI entry point for SuperGhidra:
-SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite.
+SuperGhidra: Autonomous Agent Reverse Engineering, Lock-Free Ghidra Daemon & C++ Recovery Suite.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="superghidra",
-        description="SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite",
+        description="SuperGhidra: Autonomous Agent Reverse Engineering, Lock-Free Ghidra Daemon & C++ Recovery Suite",
     )
     parser.add_argument(
         "-v", "--version", action="store_true", help="Show SuperGhidra version and environment"

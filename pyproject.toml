@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "superghidra"
 version = "0.3.0"
-description = "SuperGhidra: Compilable C Rewriter & Guardrailed Agent MCP Suite"
+description = "SuperGhidra: Autonomous Agent Reverse Engineering, Lock-Free Ghidra Daemon & C++ Recovery Suite"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
 authors = [
