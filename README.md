@@ -212,6 +212,16 @@ ghidra_extension_skeleton/   Java BufferFile codec
 
 If you're an AI agent, start with [AGENTS.md](AGENTS.md).
 
+## Donate
+
+If you find SuperGhidra useful, crypto donations (fast & permissionless) are welcome:
+
+**USDT (BEP20 / BNB Smart Chain):**
+
+```
+0xd08d47bde441888166b801616754c667672cd502
+```
+
 ## Contributing
 
 Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the test workflow and the safety rules: read-only projects, verified symbol commits and the emulator allow-list. Report security issues as described in [SECURITY.md](SECURITY.md).
