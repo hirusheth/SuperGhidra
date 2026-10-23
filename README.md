@@ -183,7 +183,9 @@ pip install git+https://github.com/yuatemycat/SuperGhidraMCP.git
 ["--from", "git+https://github.com/yuatemycat/SuperGhidraMCP.git", "superghidra-mcp", "-t", "stdio", "--project-path", "<path_to_gpr_or_binary>"]
 ```
 
-### Cursor (`.cursor/mcp.json`)
+### Cursor (`.cursor/mcp.json`) & Antigravity (`~/.gemini/config/mcp_config.json`)
+
+Both Cursor and Antigravity use standard JSON `mcpServers` configuration:
 
 ```json
 {
@@ -205,29 +207,25 @@ pip install git+https://github.com/yuatemycat/SuperGhidraMCP.git
 }
 ```
 
-### Antigravity / HTTP Transport
+### Claude Code CLI & Streamable HTTP Transport
 
-For remote daemon connections or HTTP-based agent configurations:
+If running the server via HTTP (`superghidra-mcp --transport streamable-http --port 8000`):
 
-```bash
-claude mcp add --transport http superghidra http://127.0.0.1:8000/mcp
-```
+* **Claude Code CLI:**
+  ```bash
+  claude mcp add --transport http superghidra http://127.0.0.1:8000/mcp
+  ```
 
-Or configure via YAML:
-
-```yaml
-mcp_servers:
-  superghidra:
-    command: superghidra-mcp
-    args:
-      - "-t"
-      - "stdio"
-      - "--project-path"
-      - "<path_to_gpr_or_binary>"
-    env:
-      GHIDRA_INSTALL_DIR: "/opt/ghidra"
-      JAVA_HOME: "/path/to/jdk-21"
-```
+* **HTTP URL Config (Antigravity / Cursor / Claude Desktop):**
+  ```json
+  {
+    "mcpServers": {
+      "superghidra": {
+        "url": "http://127.0.0.1:8000/mcp"
+      }
+    }
+  }
+  ```
 
 ## Subsystem Capabilities & Hardware Matrix
 
