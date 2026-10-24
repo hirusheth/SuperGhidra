@@ -180,7 +180,42 @@ class TestSyntheticDll(unittest.TestCase):
             R.recover_classes(build_elf(64, "little", 0x3E)[0])
 
 
-MFC64 = r"C:\Windows\System32\mfc140u.dll"
+class TestRttiRecoverCli(unittest.TestCase):
+    """`superghidra rtti-recover` must stay in step with recover_classes()."""
+
+    def _run(self, *args):
+        import subprocess
+        import sys
+        from pathlib import Path
+        return subprocess.run([sys.executable, "-m", "superghidra", "rtti-recover", *args],
+                              capture_output=True, text=True, cwd=str(Path(__file__).parents[2]))
+
+    def test_writes_report_json(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            dll, out = Path(tmp) / "t.dll", Path(tmp) / "classes.json"
+            dll.write_bytes(build_mfc_dll())
+            proc = self._run(str(dll), "-o", str(out))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("2 MFC runtime classes (1 serializable)", proc.stdout)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(report["counts"]["mfc_serializable"], 1)
+            self.assertIn("CFeature", [c["name"] for c in report["mfc_classes"]])
+
+    def test_non_pe_exits_nonzero(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            junk = Path(tmp) / "junk.bin"
+            junk.write_bytes(b"\x7fELF" + b"\x00" * 64)
+            proc = self._run(str(junk))
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("Error:", proc.stderr)
+
+
+MFC64 =r"C:\Windows\System32\mfc140u.dll"
 MFC32 = r"C:\Windows\SysWOW64\mfc140u.dll"
 
 

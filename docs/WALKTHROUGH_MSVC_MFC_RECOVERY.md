@@ -24,16 +24,20 @@ python -m superghidra.formats.serialize_trace target.dll CMyDoc
 
 ### Example Output (`classes.json` & `serialize_trace`)
 
-`superghidra rtti-recover` writes a structured JSON map of recovered classes and vtable RVAs:
+`superghidra rtti-recover` writes a JSON report with `counts`, an `rtti_classes` list (mangled name, bases, vtables) and an `mfc_classes` list (`CRuntimeClass` fields plus the resolved `Serialize()` body). This `mfc_classes` entry is real output from `mfc140u.dll`:
 
 ```json
 {
-  "CMyDoc": {
-    "vtable_rvas": ["0x28410"],
-    "methods_count": 14,
-    "base_classes": ["CDocument", "CCmdTarget", "CObject"],
-    "has_rtti": true
-  }
+  "name": "CDWordArray",
+  "address": "0x1803b1838",
+  "object_size": 40,
+  "schema": 0,
+  "versionable": false,
+  "base_name": "CObject",
+  "vtable": "0x180321130",
+  "serialize": "0x1801d4440",
+  "serialize_slot": 2,
+  "serializable": true
 }
 ```
 

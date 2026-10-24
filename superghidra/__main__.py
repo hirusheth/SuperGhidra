@@ -228,28 +228,23 @@ def cmd_flirt_match(args: argparse.Namespace) -> int:
 
 
 def cmd_rtti_recover(args: argparse.Namespace) -> int:
-    from superghidra.formats.msvc_class_recovery import MSVCClassRecovery
+    from superghidra.formats.msvc_class_recovery import recover_classes
 
     if not args.binary.is_file():
         print(f"Error: binary not found: {args.binary}", file=sys.stderr)
         return 1
 
-    data = args.binary.read_bytes()
-    recovery = MSVCClassRecovery(data)
-    classes = recovery.recover_classes()
-    print(f"Recovered {len(classes)} C++ classes.")
+    try:
+        report = recover_classes(str(args.binary)).to_dict()
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    counts = report["counts"]
+    print(f"Recovered {counts['rtti']} RTTI classes and {counts['mfc']} MFC runtime classes "
+          f"({counts['mfc_serializable']} serializable).")
 
     if args.output:
-        serializable = {
-            name: {
-                "vtable_rvas": [hex(v) for v in c.vtable_rvas],
-                "methods_count": len(c.methods),
-                "base_classes": c.base_classes,
-                "has_rtti": c.has_rtti,
-            }
-            for name, c in classes.items()
-        }
-        args.output.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
+        args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"Saved class hierarchy to {args.output}")
     return 0
 

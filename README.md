@@ -11,6 +11,25 @@ Python tools that make Ghidra faster to script against, rewrite raw decompiler o
 
 Instead of paying 5–15 seconds of JVM startup per headless run or fighting `.rep` project lock contention while the Ghidra GUI is open, SuperGhidra keeps a single read-only Ghidra instance warm in a background daemon (`127.0.0.1:5073`) backed by an L2 SQLite cache and a non-destructive JSON write overlay. Heavy binary sweeps and class-layout recovery run in pure Python, NumPy SIMD, or WGPU compute shaders without touching the JVM.
 
+![SuperGhidra recovering 755 RTTI classes and 391 MFC classes from mfc140u.dll, then tracing CDWordArray::Serialize, with no Ghidra or JVM](docs/assets/demo.gif)
+
+## Try It in 60 Seconds
+
+No Ghidra needed, just Python. Recover MSVC RTTI classes and MFC `Serialize()` layouts straight from a PE file:
+
+```bash
+pip install superghidra
+superghidra rtti-recover target.dll -o classes.json
+python -m superghidra.formats.serialize_trace target.dll CMyDoc
+```
+
+Want an AI agent (Claude Desktop, Claude Code, Cursor, Antigravity) driving Ghidra without GUI lockups? Install the MCP server and point it at your project; see [Agent & MCP Configuration](#agent--mcp-configuration-claude-desktop-cursor-antigravity) for the config block. `GHIDRA_INSTALL_DIR` and `JAVA_HOME` must be set (Ghidra 11/12 + OpenJDK 21):
+
+```bash
+pip install git+https://github.com/yuatemycat/SuperGhidraMCP.git
+claude mcp add superghidra -- superghidra-mcp -t stdio --project-path <path_to_gpr_or_binary>
+```
+
 ## Choose Your Operating Mode First
 
 SuperGhidra spans four distinct execution paths. Pick the entry point that matches your task before running commands:

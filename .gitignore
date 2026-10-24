@@ -36,3 +36,6 @@ scripts/telemetry_monitor.py
 scripts/telemetry_state.json
 
 *.egg-info/
+
+# Local launch drafts (not part of the tool)
+REPUTATION/
