@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     # Core Domain

@@ -41,16 +41,19 @@ python -m superghidra.formats.serialize_trace target.dll CMyDoc
 }
 ```
 
-`serialize_trace` walks `CMyDoc::Serialize(CArchive&)` across branches (`Ar.IsStoring()` vs. `Ar.IsLoading()`) and reports ordered field offsets, widths, and archive operations:
+`serialize_trace` walks the class's `Serialize(CArchive&)` body across the loading and storing branches and reports each archive read or write, the `this` offset it targets, and the branch conditions. This is real output from `python -m superghidra.formats.serialize_trace mfc140u.dll CDWordArray`:
 
 ```text
-Class: CMyDoc (schema=0x0002, object_size=0x68, vtable_slot=2 -> 0x180014200)
-  [LOAD/STORE mirrored=True]
-  +0x20: u32      ArchiveOp(op='>>', width=4, target_offset=0x20)  # m_dwVersionFlags
-  +0x24: u32      ArchiveOp(op='>>', width=4, target_offset=0x24)  # m_nRecordCount
-  +0x28: cstring  ArchiveOp(op='>>', width=8, target_offset=0x28)  # m_strHeaderTitle
-  +0x30: f64      ArchiveOp(op='>>', width=8, target_offset=0x30)  # m_dScaleFactor
+== CDWordArray  0x1801d4440  mirrored=True
+  load:
+     read count
+     read bytes (repeated) -> this+0x8  [this+0x10 != 0x0]
+  store:
+     write count <- this+0x10
+     write bytes (repeated) <- this+0x8  [this+0x10 != 0x0]
 ```
+
+`mirrored=True` means the load and store paths perform the same kinds of operations in order, a cheap self-check of the recovered layout. Field names are not recovered; you assign them from the offsets.
 
 ---
 
